@@ -1,6 +1,7 @@
 //! Model Context Protocol server: lets an agent read the mail its own actions
 //! caused. Transport-agnostic — the HTTP endpoint and the stdio command both
-//! feed JSON-RPC messages to [`Mcp::handle`].
+//! feed JSON-RPC messages to [`Mcp::handle`], along with what the caller may
+//! reach: an agent holding an inbox's API key works inside that inbox.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +11,8 @@ use serde_json::{Value, json};
 
 use crate::compose::SendRequest;
 use crate::model::ListFilter;
-use crate::store::{Store, now_ms};
+use crate::security::Access;
+use crate::store::{DEFAULT_INBOX, InboxError, Store, now_ms};
 
 /// Newest first. A client asking for a version not listed is answered with the
 /// first, and decides for itself whether it can speak it.
@@ -24,8 +26,12 @@ const MAX_INLINE_ATTACHMENT: usize = 256 * 1024;
 const INSTRUCTIONS: &str = "emailulator catches the email an application under development sends, \
 instead of delivering it. Use these tools to check what was sent: after triggering something \
 that emails (a sign-up, a password reset, an invoice), call wait_for_message with the recipient \
-address, then read the body or the links it returns. Each recipient address is its own mailbox. \
+address in `to`, then read the body or the links it returns. Mail is kept in inboxes, one per \
+application. With an inbox's API key every tool works inside that inbox and the `inbox` argument \
+is unnecessary; with admin access, pass `inbox` to work in one or leave it out to span them all. \
 Search queries accept bare words and from:, to:, subject:, is:unread, is:starred, has:attachment.";
+
+const INBOX_ARG: &str = "The inbox to work in, by id or name. Needed only with admin access; an inbox API key is already confined to its own.";
 
 pub struct Mcp {
     store: Arc<Store>,
@@ -37,11 +43,12 @@ fn tools() -> Value {
         {
             "name": "list_messages",
             "title": "List messages",
-            "description": "List caught emails, newest first. Returns summaries: id, sender, recipients, subject, a snippet and flags. Use get_message for a body.",
+            "description": "List caught emails, newest first. Returns summaries: id, inbox, sender, recipients, subject, a snippet and flags. Use get_message for a body.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "mailbox": {"type": "string", "description": "Only messages delivered to this recipient address."},
+                    "inbox": {"type": "string", "description": INBOX_ARG},
+                    "to": {"type": "string", "description": "Only messages delivered to exactly this recipient address."},
                     "query": {"type": "string", "description": "Search terms, e.g. `subject:reset is:unread` or a bare word."},
                     "unread_only": {"type": "boolean", "description": "Only unread messages."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "How many to return. Default 20."},
@@ -74,7 +81,8 @@ fn tools() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "mailbox": {"type": "string", "description": "The recipient address to watch."},
+                    "inbox": {"type": "string", "description": INBOX_ARG},
+                    "to": {"type": "string", "description": "The recipient address to watch for."},
                     "query": {"type": "string", "description": "Search terms the message must match."},
                     "after_id": {"type": "integer", "description": "Only messages newer than this id. Overrides since_seconds."},
                     "since_seconds": {"type": "integer", "minimum": 0, "description": "How far back an already-arrived message may be. Default 60."},
@@ -90,6 +98,21 @@ fn tools() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "integer"}},
+                "required": ["id"]
+            },
+            "annotations": {"readOnlyHint": true}
+        },
+        {
+            "name": "check_message",
+            "title": "Check email client support",
+            "description": "Report which email clients will not render a message as written: each HTML or CSS feature it uses that Gmail, Outlook, Apple Mail, Yahoo or Samsung Email lacks or only partly supports, with the platforms affected and why, plus notices such as Gmail clipping. Use it after changing an email template. It reads the markup; it does not render it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "clients": {"type": "array", "items": {"type": "string"}, "description": "Client families to check, e.g. [\"outlook\"]. Default: gmail, outlook, apple-mail, yahoo, samsung-email. Pass [\"all\"] for every client in the dataset."},
+                    "max_issues": {"type": "integer", "minimum": 1, "description": "Report at most this many issues, worst first. Default 25."}
+                },
                 "required": ["id"]
             },
             "annotations": {"readOnlyHint": true}
@@ -123,9 +146,9 @@ fn tools() -> Value {
             "annotations": {"readOnlyHint": true}
         },
         {
-            "name": "list_mailboxes",
-            "title": "List mailboxes",
-            "description": "Every recipient address that has received mail, with total and unread counts.",
+            "name": "list_inboxes",
+            "title": "List inboxes",
+            "description": "The inboxes within reach, with total and unread counts: every inbox with admin access, the caller's own with an inbox API key.",
             "inputSchema": {"type": "object", "properties": {}},
             "annotations": {"readOnlyHint": true}
         },
@@ -147,10 +170,11 @@ fn tools() -> Value {
         {
             "name": "send_message",
             "title": "Deliver a test message",
-            "description": "Put an email into the catcher as if an application had sent it. Nothing leaves the catcher. Useful for seeding a mailbox.",
+            "description": "Put an email into an inbox as if an application had sent it. Nothing leaves the catcher. Useful for seeding test data.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "inbox": {"type": "string", "description": "The inbox to deliver into. Needed only with admin access, where it defaults to `default`."},
                     "from": {"type": "string", "description": "`a@b` or `Name <a@b>`."},
                     "to": {"type": "array", "items": {"type": "string"}},
                     "cc": {"type": "array", "items": {"type": "string"}},
@@ -166,13 +190,15 @@ fn tools() -> Value {
         {
             "name": "delete_messages",
             "title": "Delete messages",
-            "description": "Permanently delete one message by id, every message in one mailbox, or — with all set to true — every message. Exactly one of id, mailbox or all is required.",
+            "description": "Permanently delete messages: one by `id`, or everything matching `to` and `query`, or with `all: true` everything within reach. Give `id`, or at least one of `to`, `query` and `all`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "id": {"type": "integer"},
-                    "mailbox": {"type": "string"},
-                    "all": {"type": "boolean"}
+                    "inbox": {"type": "string", "description": INBOX_ARG},
+                    "to": {"type": "string", "description": "Delete messages delivered to exactly this address."},
+                    "query": {"type": "string", "description": "Delete messages matching these search terms."},
+                    "all": {"type": "boolean", "description": "Delete every message in the inbox, or with admin access and no inbox, in all of them."}
                 }
             },
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": true}
@@ -242,9 +268,10 @@ impl Mcp {
         }
     }
 
-    /// Handle one JSON-RPC message or batch. Returns `None` when nothing is
-    /// owed back, as for a notification.
-    pub async fn handle(&self, message: Value) -> Option<Value> {
+    /// Handle one JSON-RPC message or batch on behalf of a caller with the
+    /// given access. Returns `None` when nothing is owed back, as for a
+    /// notification.
+    pub async fn handle(&self, message: Value, access: &Access) -> Option<Value> {
         match message {
             Value::Array(batch) if batch.is_empty() => {
                 Some(rpc_error(Value::Null, -32600, "empty batch"))
@@ -252,17 +279,17 @@ impl Mcp {
             Value::Array(batch) => {
                 let mut replies = Vec::new();
                 for item in batch {
-                    if let Some(reply) = self.handle_one(item).await {
+                    if let Some(reply) = self.handle_one(item, access).await {
                         replies.push(reply);
                     }
                 }
                 (!replies.is_empty()).then_some(Value::Array(replies))
             }
-            other => self.handle_one(other).await,
+            other => self.handle_one(other, access).await,
         }
     }
 
-    async fn handle_one(&self, message: Value) -> Option<Value> {
+    async fn handle_one(&self, message: Value, access: &Access) -> Option<Value> {
         let Some(method) = message.get("method").and_then(Value::as_str) else {
             // A response to a request we never made, or not JSON-RPC at all.
             return message
@@ -312,7 +339,7 @@ impl Mcp {
                     .unwrap_or_else(|| json!({}));
                 // A tool that fails is still a successful protocol exchange: the
                 // model should see the failure and be able to correct itself.
-                let (payload, is_error) = match self.call(name, &args).await {
+                let (payload, is_error) = match self.call(name, &args, access).await {
                     Ok(value) => (value, false),
                     Err(error) => (json!({"error": error.to_string()}), true),
                 };
@@ -340,6 +367,41 @@ impl Mcp {
         tokio::task::spawn_blocking(move || f(&store)).await?
     }
 
+    /// The inbox a call is about: the caller's own if it is confined to one,
+    /// otherwise the one it names, or all of them when it names none.
+    async fn scope(&self, access: &Access, args: &Value) -> Result<Option<String>> {
+        // An inbox may be named by its id or by its name.
+        let requested = match arg_str(args, "inbox").map(str::to_string) {
+            Some(text) => {
+                let wanted = text.clone();
+                match self.store(move |s| s.resolve_inbox(&wanted)).await? {
+                    Some(id) => Some(id),
+                    None => return Err(InboxError::NotFound(text).into()),
+                }
+            }
+            None => None,
+        };
+        match (access, requested) {
+            // Said the same way whether the other inbox exists or not.
+            (Access::Inbox(own), Some(other)) if *own != other => {
+                bail!("this API key reaches one inbox only, and that is not it")
+            }
+            (Access::Inbox(own), _) => Ok(Some(own.clone())),
+            (Access::Admin, requested) => Ok(requested),
+        }
+    }
+
+    /// Refuse a message outside the caller's inbox in the same words as one
+    /// that does not exist.
+    async fn authorize(&self, access: &Access, id: i64) -> Result<()> {
+        let owner = self.store(move |s| s.message_inbox(id)).await?;
+        match (owner, access) {
+            (Some(_), Access::Admin) => Ok(()),
+            (Some(owner), Access::Inbox(own)) if owner == *own => Ok(()),
+            _ => bail!("no message with id {id}"),
+        }
+    }
+
     async fn message(&self, id: i64, args: &Value) -> Result<Value> {
         let detail = self
             .store(move |s| s.get(id))
@@ -353,11 +415,13 @@ impl Mcp {
 
         let mut out = json!({
             "id": detail.summary.id,
+            "inbox": detail.summary.inbox,
+            "inbox_name": detail.summary.inbox_name,
             "received_at": rfc3339(detail.summary.received_at),
             "from": detail.summary.from.as_ref().map(|a| a.display()),
             "to": detail.summary.to.iter().map(|a| a.display()).collect::<Vec<_>>(),
             "cc": detail.summary.cc.iter().map(|a| a.display()).collect::<Vec<_>>(),
-            "delivered_to": detail.summary.mailboxes,
+            "delivered_to": detail.summary.recipients,
             "subject": detail.summary.subject,
             "read": detail.summary.read,
             "starred": detail.summary.starred,
@@ -369,7 +433,7 @@ impl Mcp {
             (Some(text), _) => Some(text.clone()),
             // No plain part: give the agent the HTML reduced to text rather
             // than nothing.
-            (None, Some(html)) => Some(mail_parser::decoders::html::html_to_text(html)),
+            (None, Some(html)) => Some(crate::parse::html_to_text(html)),
             (None, None) => None,
         };
         if let Some(body) = body {
@@ -394,11 +458,12 @@ impl Mcp {
         Ok(out)
     }
 
-    async fn call(&self, name: &str, args: &Value) -> Result<Value> {
+    async fn call(&self, name: &str, args: &Value, access: &Access) -> Result<Value> {
         match name {
             "list_messages" => {
                 let filter = ListFilter {
-                    mailbox: arg_str(args, "mailbox").map(str::to_string),
+                    inbox: self.scope(access, args).await?,
+                    to: arg_str(args, "to").map(str::to_string),
                     query: arg_str(args, "query").map(str::to_string),
                     unread: arg_bool(args, "unread_only").then_some(true),
                     before_id: args.get("before_id").and_then(Value::as_i64),
@@ -417,10 +482,12 @@ impl Mcp {
                     .map(|m| {
                         json!({
                             "id": m.id,
+                            "inbox": m.inbox,
+                            "inbox_name": m.inbox_name,
                             "received_at": rfc3339(m.received_at),
                             "from": m.from.as_ref().map(|a| a.display()),
                             "to": m.to.iter().map(|a| a.display()).collect::<Vec<_>>(),
-                            "delivered_to": m.mailboxes,
+                            "delivered_to": m.recipients,
                             "subject": m.subject,
                             "snippet": m.snippet,
                             "read": m.read,
@@ -433,6 +500,7 @@ impl Mcp {
             }
             "get_message" => {
                 let id = arg_i64(args, "id")?;
+                self.authorize(access, id).await?;
                 if arg_bool(args, "mark_read") {
                     self.store(move |s| s.set_flags(id, Some(true), None))
                         .await?;
@@ -451,7 +519,8 @@ impl Mcp {
                     .and_then(Value::as_i64)
                     .unwrap_or(60);
                 let filter = ListFilter {
-                    mailbox: arg_str(args, "mailbox").map(str::to_string),
+                    inbox: self.scope(access, args).await?,
+                    to: arg_str(args, "to").map(str::to_string),
                     query: arg_str(args, "query").map(str::to_string),
                     after_id,
                     since: after_id
@@ -478,15 +547,58 @@ impl Mcp {
             }
             "get_links" => {
                 let id = arg_i64(args, "id")?;
+                self.authorize(access, id).await?;
                 let links = self
                     .store(move |s| s.links(id))
                     .await?
                     .ok_or_else(|| anyhow!("no message with id {id}"))?;
                 Ok(json!({"id": id, "links": links}))
             }
+            "check_message" => {
+                let id = arg_i64(args, "id")?;
+                self.authorize(access, id).await?;
+                let detail = self
+                    .store(move |s| s.get(id))
+                    .await?
+                    .ok_or_else(|| anyhow!("no message with id {id}"))?;
+                // An agent wants the clients that matter, not all twenty-two.
+                let named: Vec<String> = args
+                    .get("clients")
+                    .and_then(Value::as_array)
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(Value::as_str)
+                            .map(|c| c.trim().to_ascii_lowercase())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let only: Option<Vec<String>> = if named.iter().any(|c| c == "all") {
+                    None
+                } else if named.is_empty() {
+                    Some(
+                        ["gmail", "outlook", "apple-mail", "yahoo", "samsung-email"]
+                            .map(String::from)
+                            .to_vec(),
+                    )
+                } else {
+                    Some(named)
+                };
+                let mut report = crate::check::check(&detail, only.as_deref());
+                let max = args.get("max_issues").and_then(Value::as_u64).unwrap_or(25) as usize;
+                let total = report.issues.len();
+                report.issues.truncate(max);
+                let mut out = serde_json::to_value(&report)?;
+                out["id"] = json!(id);
+                out["has_html"] = json!(detail.html.is_some());
+                if total > max {
+                    out["issues_omitted"] = json!(total - max);
+                }
+                Ok(out)
+            }
             "get_attachment" => {
                 let id = arg_i64(args, "id")?;
                 let index = arg_i64(args, "index")? as usize;
+                self.authorize(access, id).await?;
                 let (meta, bytes) = self
                     .store(move |s| s.attachment(id, index))
                     .await?
@@ -507,6 +619,7 @@ impl Mcp {
             }
             "get_raw_message" => {
                 let id = arg_i64(args, "id")?;
+                self.authorize(access, id).await?;
                 let raw = self
                     .store(move |s| s.raw(id))
                     .await?
@@ -518,10 +631,27 @@ impl Mcp {
                 let (source, cut) = truncate(&String::from_utf8_lossy(&raw), max);
                 Ok(json!({"id": id, "size": raw.len(), "source": source, "truncated": cut}))
             }
-            "list_mailboxes" => {
-                let mailboxes = self.store(|s| s.mailboxes()).await?;
-                let stats = self.store(|s| s.stats()).await?;
-                Ok(json!({"total": stats.total, "unread": stats.unread, "mailboxes": mailboxes}))
+            "list_inboxes" => {
+                let own = access.inbox().map(str::to_string);
+                let (inboxes, stats) = self
+                    .store(move |s| {
+                        let mut inboxes = s.inboxes()?;
+                        if let Some(own) = &own {
+                            inboxes.retain(|inbox| &inbox.id == own);
+                        }
+                        Ok((inboxes, s.stats(own.as_deref())?))
+                    })
+                    .await?;
+                let inboxes: Vec<Value> = inboxes
+                    .iter()
+                    .map(|i| {
+                        json!({
+                            "id": i.id, "name": i.name, "description": i.description,
+                            "total": i.total, "unread": i.unread,
+                        })
+                    })
+                    .collect();
+                Ok(json!({"total": stats.total, "unread": stats.unread, "inboxes": inboxes}))
             }
             "mark_message" => {
                 let id = arg_i64(args, "id")?;
@@ -530,15 +660,22 @@ impl Mcp {
                 if read.is_none() && starred.is_none() {
                     bail!("give `read`, `starred`, or both");
                 }
-                if !self.store(move |s| s.set_flags(id, read, starred)).await? {
-                    bail!("no message with id {id}");
-                }
+                self.authorize(access, id).await?;
+                self.store(move |s| s.set_flags(id, read, starred)).await?;
                 Ok(json!({"id": id, "read": read, "starred": starred}))
             }
             "send_message" => {
-                let request: SendRequest = serde_json::from_value(args.clone())
-                    .map_err(|e| anyhow!("invalid message: {e}"))?;
-                let incoming = request.build()?;
+                let inbox = self
+                    .scope(access, args)
+                    .await?
+                    .unwrap_or_else(|| DEFAULT_INBOX.to_string());
+                let mut fields = args.clone();
+                if let Some(object) = fields.as_object_mut() {
+                    object.remove("inbox");
+                }
+                let request: SendRequest =
+                    serde_json::from_value(fields).map_err(|e| anyhow!("invalid message: {e}"))?;
+                let incoming = request.build(&inbox)?;
                 if incoming.raw.len() > self.max_message_size {
                     bail!(
                         "the message exceeds the {} byte limit",
@@ -546,22 +683,32 @@ impl Mcp {
                     );
                 }
                 let summary = self.store(move |s| s.insert(incoming)).await?;
-                Ok(json!({"id": summary.id, "delivered_to": summary.mailboxes}))
+                Ok(
+                    json!({"id": summary.id, "inbox": summary.inbox, "delivered_to": summary.recipients}),
+                )
             }
             "delete_messages" => {
-                let id = args.get("id").and_then(Value::as_i64);
-                let mailbox = arg_str(args, "mailbox").map(str::to_string);
-                let all = arg_bool(args, "all");
-                let chosen =
-                    usize::from(id.is_some()) + usize::from(mailbox.is_some()) + usize::from(all);
-                if chosen != 1 {
-                    bail!("give exactly one of `id`, `mailbox`, or `all: true`");
+                if let Some(id) = args.get("id").and_then(Value::as_i64) {
+                    self.authorize(access, id).await?;
+                    let deleted = self.store(move |s| s.delete(id)).await?;
+                    return Ok(json!({"deleted": usize::from(deleted)}));
                 }
-                let deleted = match (id, mailbox) {
-                    (Some(id), _) => usize::from(self.store(move |s| s.delete(id)).await?),
-                    (None, Some(mailbox)) => self.store(move |s| s.clear(Some(&mailbox))).await?,
-                    (None, None) => self.store(|s| s.clear(None)).await?,
+                let to = arg_str(args, "to").map(str::to_string);
+                let query = arg_str(args, "query").map(str::to_string);
+                // Deleting a whole inbox, or everything, has to be said outright
+                // rather than follow from having left the filters out.
+                if to.is_none() && query.is_none() && !arg_bool(args, "all") {
+                    bail!(
+                        "give `id`, a `to` or `query` to match, or `all: true` to delete everything within reach"
+                    );
+                }
+                let filter = ListFilter {
+                    inbox: self.scope(access, args).await?,
+                    to,
+                    query,
+                    ..Default::default()
                 };
+                let deleted = self.store(move |s| s.clear(&filter)).await?;
                 Ok(json!({"deleted": deleted}))
             }
             other => bail!("unknown tool: {other}"),
@@ -570,7 +717,7 @@ impl Mcp {
 }
 
 /// Serve MCP over stdio: one JSON-RPC message per line in, one per line out.
-pub async fn serve_stdio(mcp: Mcp) -> Result<()> {
+pub async fn serve_stdio(mcp: Mcp, access: Access) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -580,7 +727,7 @@ pub async fn serve_stdio(mcp: Mcp) -> Result<()> {
             continue;
         }
         let reply = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => mcp.handle(message).await,
+            Ok(message) => mcp.handle(message, &access).await,
             Err(error) => Some(rpc_error(
                 Value::Null,
                 -32700,
@@ -603,18 +750,21 @@ mod tests {
     use crate::model::Source;
     use crate::store::Incoming;
 
+    const ADMIN: Access = Access::Admin;
+
     fn mcp() -> (Mcp, Arc<Store>) {
         let store = Arc::new(Store::in_memory().unwrap());
         (Mcp::new(store.clone(), 1024 * 1024), store)
     }
 
-    fn deliver(store: &Store, to: &str, subject: &str, body: &str) -> i64 {
+    fn deliver_in(store: &Store, inbox: &str, to: &str, subject: &str, body: &str) -> i64 {
         store
             .insert(Incoming {
                 raw: format!(
                     "From: app@x.test\r\nTo: {to}\r\nSubject: {subject}\r\n\r\n{body}\r\n"
                 )
                 .into_bytes(),
+                inbox: inbox.into(),
                 envelope_from: None,
                 envelope_to: vec![to.into()],
                 source: Source::Smtp,
@@ -623,10 +773,17 @@ mod tests {
             .id
     }
 
-    async fn call(mcp: &Mcp, name: &str, arguments: Value) -> (Value, bool) {
+    fn deliver(store: &Store, to: &str, subject: &str, body: &str) -> i64 {
+        deliver_in(store, DEFAULT_INBOX, to, subject, body)
+    }
+
+    async fn call_as(mcp: &Mcp, access: &Access, name: &str, arguments: Value) -> (Value, bool) {
         let reply = mcp
-            .handle(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                           "params": {"name": name, "arguments": arguments}}))
+            .handle(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": name, "arguments": arguments}}),
+                access,
+            )
             .await
             .unwrap();
         let result = &reply["result"];
@@ -636,6 +793,10 @@ mod tests {
         )
     }
 
+    async fn call(mcp: &Mcp, name: &str, arguments: Value) -> (Value, bool) {
+        call_as(mcp, &ADMIN, name, arguments).await
+    }
+
     #[tokio::test]
     async fn negotiates_a_protocol_version() {
         let (mcp, _) = mcp();
@@ -643,10 +804,10 @@ mod tests {
             json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                    "params": {"protocolVersion": version, "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}})
         };
-        let reply = mcp.handle(init("2025-03-26")).await.unwrap();
+        let reply = mcp.handle(init("2025-03-26"), &ADMIN).await.unwrap();
         assert_eq!(reply["result"]["protocolVersion"], "2025-03-26");
         assert_eq!(reply["result"]["serverInfo"]["name"], "emailulator");
-        let reply = mcp.handle(init("1999-01-01")).await.unwrap();
+        let reply = mcp.handle(init("1999-01-01"), &ADMIN).await.unwrap();
         assert_eq!(reply["result"]["protocolVersion"], PROTOCOL_VERSIONS[0]);
     }
 
@@ -654,15 +815,18 @@ mod tests {
     async fn notifications_get_no_reply_and_unknown_methods_an_error() {
         let (mcp, _) = mcp();
         let note = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-        assert!(mcp.handle(note).await.is_none());
+        assert!(mcp.handle(note, &ADMIN).await.is_none());
         let reply = mcp
-            .handle(json!({"jsonrpc": "2.0", "id": 7, "method": "nope"}))
+            .handle(json!({"jsonrpc": "2.0", "id": 7, "method": "nope"}), &ADMIN)
             .await
             .unwrap();
         assert_eq!(reply["error"]["code"], -32601);
         assert_eq!(reply["id"], 7);
         let reply = mcp
-            .handle(json!({"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {"name": "nope"}}))
+            .handle(
+                json!({"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {"name": "nope"}}),
+                &ADMIN,
+            )
             .await
             .unwrap();
         assert_eq!(reply["error"]["code"], -32602);
@@ -672,11 +836,14 @@ mod tests {
     async fn every_tool_has_a_schema() {
         let (mcp, _) = mcp();
         let reply = mcp
-            .handle(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+            .handle(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                &ADMIN,
+            )
             .await
             .unwrap();
         let tools = reply["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
         for tool in tools {
             assert_eq!(tool["inputSchema"]["type"], "object", "{}", tool["name"]);
             assert!(tool["description"].as_str().unwrap().len() > 20);
@@ -693,10 +860,11 @@ mod tests {
             "Go to https://app.test/reset/abc now",
         );
 
-        let (list, error) = call(&mcp, "list_messages", json!({"mailbox": "bob@x.test"})).await;
+        let (list, error) = call(&mcp, "list_messages", json!({"to": "bob@x.test"})).await;
         assert!(!error);
         assert_eq!(list["total"], 1);
         assert_eq!(list["messages"][0]["subject"], "Reset");
+        assert_eq!(list["messages"][0]["inbox"], "default");
 
         let (message, _) = call(&mcp, "get_message", json!({"id": id, "mark_read": true})).await;
         assert_eq!(message["links"][0]["url"], "https://app.test/reset/abc");
@@ -710,9 +878,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_inbox_key_confines_every_tool_to_its_inbox() {
+        let (mcp, store) = mcp();
+        store.create_inbox("billing").unwrap();
+        store.create_inbox("marketing").unwrap();
+        let invoice = deliver_in(&store, "billing", "bob@x.test", "Invoice", "x");
+        let promo = deliver_in(
+            &store,
+            "marketing",
+            "bob@x.test",
+            "Sale",
+            "see https://shop.test/sale",
+        );
+        let billing = Access::Inbox("billing".into());
+
+        let (list, _) = call_as(&mcp, &billing, "list_messages", json!({})).await;
+        assert_eq!(list["total"], 1);
+        assert_eq!(list["messages"][0]["id"], invoice);
+        let (inboxes, _) = call_as(&mcp, &billing, "list_inboxes", json!({})).await;
+        assert_eq!(inboxes["inboxes"].as_array().unwrap().len(), 1);
+        assert_eq!(inboxes["inboxes"][0]["id"], "billing");
+
+        // Naming another inbox is an error, not a silent switch or an empty list.
+        let (refused, error) = call_as(
+            &mcp,
+            &billing,
+            "list_messages",
+            json!({"inbox": "marketing"}),
+        )
+        .await;
+        assert!(error, "{refused}");
+
+        // Another inbox's message is out of reach by id, in every tool that takes one.
+        for (tool, args) in [
+            ("get_message", json!({"id": promo})),
+            ("get_links", json!({"id": promo})),
+            ("get_raw_message", json!({"id": promo})),
+            ("get_attachment", json!({"id": promo, "index": 0})),
+            ("mark_message", json!({"id": promo, "read": true})),
+            ("delete_messages", json!({"id": promo})),
+        ] {
+            let (reply, error) = call_as(&mcp, &billing, tool, args).await;
+            assert!(error, "{tool}: {reply}");
+            assert!(
+                reply["error"].as_str().unwrap().contains("no message"),
+                "{tool}: {reply}"
+            );
+        }
+        assert!(!store.get(promo).unwrap().unwrap().summary.read);
+
+        // What it sends and deletes stays in its inbox.
+        let (sent, error) = call_as(
+            &mcp,
+            &billing,
+            "send_message",
+            json!({"from": "a@x.test", "to": ["b@x.test"], "subject": "Seed"}),
+        )
+        .await;
+        assert!(!error, "{sent}");
+        assert_eq!(sent["inbox"], "billing");
+        let (deleted, _) = call_as(&mcp, &billing, "delete_messages", json!({"all": true})).await;
+        assert_eq!(deleted["deleted"], 2);
+        assert!(
+            store.get(promo).unwrap().is_some(),
+            "marketing's mail is untouched"
+        );
+
+        // The admin spans inboxes, or names one.
+        let (all, _) = call(&mcp, "list_messages", json!({})).await;
+        assert_eq!(all["total"], 1);
+        let (one, _) = call(&mcp, "list_messages", json!({"inbox": "billing"})).await;
+        assert_eq!(one["total"], 0);
+        let (unknown, error) = call(&mcp, "list_messages", json!({"inbox": "nowhere"})).await;
+        assert!(error, "{unknown}");
+    }
+
+    #[tokio::test]
+    async fn checks_a_message_against_the_main_clients() {
+        let (mcp, store) = mcp();
+        let id = store
+            .insert(Incoming {
+                raw: b"From: a@x.test\r\nTo: b@x.test\r\nSubject: s\r\nContent-Type: text/html\r\n\r\n\
+                       <div style=\"display:flex\"><p style=\"border-radius:4px\">Hi</p></div>\r\n"
+                    .to_vec(),
+                inbox: DEFAULT_INBOX.into(),
+                envelope_from: None,
+                envelope_to: vec!["b@x.test".into()],
+                source: Source::Smtp,
+            })
+            .unwrap()
+            .id;
+
+        let (report, error) = call(&mcp, "check_message", json!({"id": id})).await;
+        assert!(!error, "{report}");
+        assert_eq!(
+            report["clients"].as_array().unwrap().len(),
+            5,
+            "the main clients by default"
+        );
+        let flex = report["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["slug"] == "css-display-flex")
+            .expect("flexbox is reported");
+        assert!(
+            flex["clients"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["family"] == "outlook")
+        );
+        assert!(
+            report["notices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["code"] == "no-text-part")
+        );
+
+        let (one, _) = call(
+            &mcp,
+            "check_message",
+            json!({"id": id, "clients": ["outlook"], "max_issues": 1}),
+        )
+        .await;
+        assert_eq!(one["clients"].as_array().unwrap().len(), 1);
+        assert_eq!(one["issues"].as_array().unwrap().len(), 1);
+        assert!(one["issues_omitted"].as_u64().unwrap() >= 1);
+
+        let (everyone, _) =
+            call(&mcp, "check_message", json!({"id": id, "clients": ["all"]})).await;
+        assert!(everyone["clients"].as_array().unwrap().len() > 15);
+
+        let (_, error) = call(&mcp, "check_message", json!({"id": 404})).await;
+        assert!(error);
+    }
+
+    #[tokio::test]
     async fn waits_for_mail_that_arrives_later() {
         let (mcp, store) = mcp();
-        deliver(&store, "bob@x.test", "Old", "not this mailbox's concern");
+        deliver(
+            &store,
+            "bob@x.test",
+            "Old",
+            "not the recipient being waited on",
+        );
         let sender = store.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -721,7 +1032,7 @@ mod tests {
         let (found, error) = call(
             &mcp,
             "wait_for_message",
-            json!({"mailbox": "carol@x.test", "timeout_seconds": 5}),
+            json!({"to": "carol@x.test", "timeout_seconds": 5}),
         )
         .await;
         assert!(!error, "{found}");
@@ -730,7 +1041,7 @@ mod tests {
         let (timed_out, error) = call(
             &mcp,
             "wait_for_message",
-            json!({"mailbox": "nobody@x.test", "timeout_seconds": 1}),
+            json!({"to": "nobody@x.test", "timeout_seconds": 1}),
         )
         .await;
         assert!(error);
@@ -752,12 +1063,15 @@ mod tests {
         )
         .await;
         assert!(!error, "{sent}");
-        assert_eq!(store.stats().unwrap().total, 1);
+        assert_eq!(sent["inbox"], "default");
+        deliver(&store, "c@x.test", "Other", "x");
 
         let (_, error) = call(&mcp, "delete_messages", json!({})).await;
         assert!(error, "deleting needs an explicit target");
-        let (_, error) = call(&mcp, "delete_messages", json!({"id": 1, "all": true})).await;
-        assert!(error, "and only one target");
+        let (_, error) = call(&mcp, "delete_messages", json!({"inbox": "default"})).await;
+        assert!(error, "naming an inbox is not saying to empty it");
+        let (deleted, _) = call(&mcp, "delete_messages", json!({"to": "c@x.test"})).await;
+        assert_eq!(deleted["deleted"], 1);
         let (deleted, error) = call(&mcp, "delete_messages", json!({"all": true})).await;
         assert!(!error);
         assert_eq!(deleted["deleted"], 1);

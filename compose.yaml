@@ -1,7 +1,13 @@
 # docker compose up -d
 #
-# Both secrets are required; compose stops with the message below if either is
-# missing. `openssl rand -hex 32` makes a good value for each.
+# EMAILULATOR_AUTH_TOKEN is required: it is the admin token, for the web UI
+# and for managing inboxes. Compose stops with the message below without it.
+# `openssl rand -hex 32` makes a good value.
+#
+# EMAILULATOR_PROVISION is optional: inbox=key pairs, comma-separated, made
+# valid at startup, for giving an app its SMTP password through configuration:
+#   EMAILULATOR_PROVISION=billing-app=<key>
+# The app then sends with username billing-app and that key as its password.
 
 services:
   emailulator:
@@ -9,7 +15,7 @@ services:
     restart: unless-stopped
     environment:
       EMAILULATOR_AUTH_TOKEN: ${EMAILULATOR_AUTH_TOKEN:?set EMAILULATOR_AUTH_TOKEN to a long random token}
-      EMAILULATOR_SMTP_AUTH: ${EMAILULATOR_SMTP_AUTH:?set EMAILULATOR_SMTP_AUTH to user:password}
+      EMAILULATOR_PROVISION: ${EMAILULATOR_PROVISION:-}
     ports:
       # Published on this host's loopback only. To reach it from elsewhere, put
       # a TLS-terminating reverse proxy in front of 8025, or mount a certificate

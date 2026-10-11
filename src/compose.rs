@@ -151,9 +151,9 @@ fn builder_list(addresses: &[Address]) -> BuilderAddress<'_> {
 }
 
 impl SendRequest {
-    /// Assemble the message. Bcc recipients are delivered to but, as with SMTP,
-    /// appear in no header.
-    pub fn build(&self) -> Result<Incoming> {
+    /// Assemble the message for delivery into `inbox`. Bcc recipients are
+    /// delivered to but, as with SMTP, appear in no header.
+    pub fn build(&self, inbox: &str) -> Result<Incoming> {
         let from = self.from.resolve("from")?;
         let to = self.to.resolve("to")?;
         let cc = self.cc.resolve("cc")?;
@@ -248,6 +248,7 @@ impl SendRequest {
         let raw = builder.write_to_vec()?;
         Ok(Incoming {
             raw,
+            inbox: inbox.to_string(),
             envelope_from: Some(from.address),
             envelope_to: to
                 .into_iter()
@@ -266,7 +267,7 @@ mod tests {
     use crate::parse;
 
     fn request(json: serde_json::Value) -> Result<Incoming> {
-        serde_json::from_value::<SendRequest>(json)?.build()
+        serde_json::from_value::<SendRequest>(json)?.build("default")
     }
 
     #[test]

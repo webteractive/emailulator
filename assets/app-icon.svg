@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- The Dock icon: ui/icon.svg on the macOS icon grid, an 824 tile inside a
+       1024 canvas. app-icon.png is this file rendered, and is what the app
+       loads; after a change, run
+       rsvg-convert -w 1024 assets/app-icon.svg -o assets/app-icon.png -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="#2f6feb"/>
+  <g transform="translate(100 100) scale(12.875)" fill="none" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <path stroke="#c5d7f9" d="M15 20l17 14 17-14"/>
+    <path stroke="#fff" d="M25 18H13v28h12M39 18h12v28H39"/>
+  </g>
+</svg>

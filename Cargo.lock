@@ -1838,6 +1838,7 @@ dependencies = [
  "mail-builder",
  "mail-parser",
  "mime_guess",
+ "objc2",
  "ring",
  "rusqlite",
  "rust-embed",

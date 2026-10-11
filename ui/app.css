@@ -15,6 +15,7 @@
   --text-3: #85857e;
   --accent: #2f5fd0;
   --accent-text: #2a55ba;
+  --brand: #2f6feb;
   --on-accent: #ffffff;
   --danger: #b93a2b;
   --star: #c98a00;
@@ -43,6 +44,7 @@
     --text-3: #77777e;
     --accent: #6d9bff;
     --accent-text: #8fb2ff;
+    --brand: #8fb2ff;
     --on-accent: #0c1326;
     --danger: #ff8272;
     --star: #f0b63c;
@@ -339,13 +341,14 @@ kbd {
   flex: none;
 }
 
-.brand img {
-  border-radius: 5px;
-}
-
 .brand-name {
   font-weight: 650;
   letter-spacing: -0.01em;
+}
+
+/* The name is "email" and the tail of "emulator"; the logo sets the join. */
+.brand-tail {
+  color: var(--brand);
 }
 
 .brand-version {
@@ -1115,10 +1118,6 @@ kbd {
   background: var(--bg);
 }
 
-.login-card img {
-  border-radius: 9px;
-}
-
 .login-card h1 {
   font-size: 18px;
   font-weight: 650;
@@ -1278,4 +1277,554 @@ kbd {
   .sidebar {
     transition: none;
   }
+}
+
+/* ------------------------------------------------------------------- inboxes */
+
+.mono {
+  font-family: var(--mono);
+}
+
+h3 {
+  margin: 0;
+}
+
+.btn-small {
+  height: 26px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
+.btn-quiet-danger:hover:not(:disabled) {
+  color: var(--danger);
+}
+
+.btn-danger-outline {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.btn-danger-outline:hover:not(:disabled) {
+  background: var(--danger);
+  color: var(--bg);
+}
+
+.nav-heading {
+  align-items: center;
+  justify-content: flex-start;
+}
+
+.nav-heading-count {
+  margin: 0 auto 0 6px;
+}
+
+.nav-add {
+  width: 20px;
+  height: 20px;
+  margin: -3px -2px -3px 0;
+}
+
+.nav-add .icon {
+  width: 13px;
+  height: 13px;
+}
+
+.nav-add[aria-expanded="true"] {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.new-inbox {
+  padding: 2px 0 8px;
+}
+
+.new-inbox-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.new-inbox-row .field {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-family: var(--mono);
+}
+
+.new-inbox .hint,
+.new-inbox .form-error {
+  padding: 4px 2px 0;
+}
+
+.connect-open {
+  flex: none;
+  margin-right: 2px;
+}
+
+.connect-open[aria-pressed="true"] {
+  background: var(--bg-selected);
+  color: var(--text);
+}
+
+/* Names the inbox on a row of a list that mixes inboxes. */
+.row-inbox {
+  flex: none;
+  max-width: 42%;
+  margin-left: 0;
+  overflow: hidden;
+  font-size: 10.5px;
+  letter-spacing: 0;
+  text-overflow: ellipsis;
+  text-transform: none;
+  white-space: nowrap;
+  vertical-align: baseline;
+}
+
+/* ------------------------------------------------------------ connect panel */
+
+.panel-head {
+  align-items: center;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.panel-head .reader-subject {
+  padding-top: 0;
+}
+
+.panel {
+  width: 100%;
+  max-width: 720px;
+  padding: 16px 18px 40px;
+}
+
+.panel-lead {
+  margin-bottom: 14px;
+  color: var(--text-2);
+  font-size: 13.5px;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 16px;
+}
+
+.facts dt {
+  color: var(--text-3);
+}
+
+.facts dd {
+  overflow-wrap: anywhere;
+}
+
+.facts dd.mono {
+  font-size: 12.5px;
+  user-select: all;
+}
+
+.panel-section {
+  margin-top: 24px;
+}
+
+.panel-section h3 {
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.panel-section > .hint {
+  margin-bottom: 8px;
+}
+
+.panel-note {
+  margin-top: 16px;
+}
+
+#keys-list > .hint {
+  margin-bottom: 8px;
+}
+
+.keys {
+  width: 100%;
+  margin-bottom: 10px;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.keys th,
+.keys td {
+  padding: 5px 12px 5px 0;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.keys thead th {
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.keys tbody th {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.key-prefix {
+  font-family: var(--mono);
+  white-space: nowrap;
+}
+
+.keys .key-actions {
+  width: 1%;
+  padding-right: 0;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.key-form {
+  display: flex;
+  gap: 8px;
+  max-width: 460px;
+}
+
+.key-form .field {
+  flex: 1;
+  min-width: 0;
+}
+
+/* A key on its one showing. */
+.fresh-key {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--ok);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--ok) 9%, transparent);
+}
+
+.fresh-key-title {
+  font-weight: 650;
+}
+
+.fresh-key-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+}
+
+.fresh-key-value {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border-radius: var(--radius);
+  background: var(--bg-code);
+  font: 12.5px/1.4 var(--mono);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.fresh-key-note {
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.danger-zone {
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+
+.welcome-action {
+  margin-bottom: 16px;
+}
+
+@media (max-width: 720px) {
+  .panel {
+    padding: 12px 14px 32px;
+  }
+
+  .panel-head {
+    padding-left: 14px;
+  }
+
+  /* Created gives way first; label, key, last use and Revoke still fit. */
+  .keys th:nth-child(3),
+  .keys td:nth-child(3) {
+    display: none;
+  }
+
+  .key-form {
+    flex-wrap: wrap;
+  }
+}
+
+/* ----------------------------------------------------------- new inbox dialog */
+
+.dialog-form {
+  width: min(520px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+}
+
+.dialog-form h2 {
+  font-size: 17px;
+}
+
+.dialog-form .dialog-lead {
+  margin: 4px 0 14px;
+  color: var(--text-2);
+}
+
+.form-label {
+  display: block;
+  margin: 12px 0 5px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.form-aside {
+  margin-left: 6px;
+  color: var(--text-3);
+  font-weight: 400;
+}
+
+.form-label-row {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.form-label-row .form-label {
+  margin: 0 0 5px;
+}
+
+.form-actions {
+  display: inline-flex;
+  gap: 2px;
+  margin-bottom: 2px;
+}
+
+.form-actions .btn {
+  height: 24px;
+  padding: 0 7px;
+  font-size: 12px;
+}
+
+.dialog-form .field {
+  height: 32px;
+}
+
+/* A value to read and copy, not to edit: set apart from the fields above it. */
+.credential {
+  display: block;
+  min-height: 32px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-code);
+  font: 12.5px/1.4 var(--mono);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.credential-empty {
+  color: var(--text-3);
+  font-family: var(--font);
+  user-select: none;
+}
+
+.dialog-form .credential-note {
+  margin-top: 7px;
+  font-size: 12px;
+}
+
+.dialog-form .dialog-error {
+  margin-top: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+  color: var(--danger);
+}
+
+.panel-description {
+  margin-bottom: 6px;
+  color: var(--text);
+}
+
+/* ---------------------------------------------------------------------------
+   The Check tab: which clients support what the message uses
+   ------------------------------------------------------------------------ */
+
+.check {
+  padding: 16px 20px 28px;
+  max-width: 860px;
+}
+
+.check-intro {
+  margin: 0 0 14px;
+  color: var(--text-2);
+  line-height: 1.5;
+}
+
+.check-scores {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(124px, 1fr));
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.check-score {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+}
+
+/* Status is the same dot the issue list uses. */
+.check-score-name { font-weight: 600; }
+
+.check-score-name::before {
+  display: inline-block;
+  margin-right: 6px;
+  vertical-align: 1px;
+}
+
+.check-score-name::before,
+.check-issue-head::before {
+  content: "";
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warn);
+}
+
+.check-score-ok .check-score-name::before { background: var(--ok); }
+.check-score-bad .check-score-name::before { background: var(--danger); }
+.check-score-num { font-variant-numeric: tabular-nums; }
+.check-score-detail { color: var(--text-2); font-size: 12px; }
+.check-score-detail span { white-space: nowrap; }
+
+.check-toggle { margin: 10px 0 0; }
+
+.check-toggle .btn {
+  padding-left: 0;
+  color: var(--accent-text);
+}
+
+.check-toggle .btn::after { content: "→"; }
+
+.check-toggle .btn:hover:not(:disabled) {
+  background: none;
+  text-decoration: underline;
+}
+
+.check-group { margin-top: 22px; }
+
+.check-group h3 {
+  margin: 0 0 2px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.check-blurb {
+  margin: 0 0 8px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.check-issues,
+.check-clients,
+.check-notes,
+.check-notices {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.check-issue {
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+}
+
+.check-issue-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.check-issue-head::before {
+  align-self: center;
+  margin-right: -2px;
+}
+
+.check-unsupported .check-issue-head::before { background: var(--danger); }
+
+.check-issue-head a,
+.check-issue-head > span:first-child {
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  text-decoration: none;
+}
+
+.check-issue-head a::after {
+  content: "↗";
+  margin-left: 3px;
+  color: var(--text-3);
+  font-family: var(--font);
+  font-weight: 400;
+}
+
+.check-issue-head a:hover { text-decoration: underline; }
+
+.check-count { color: var(--text-2); font-size: 12px; }
+
+.check-clients li {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  column-gap: 12px;
+  padding-top: 5px;
+  font-size: 13px;
+}
+
+.check-client { font-weight: 500; }
+.check-where { color: var(--text-2); overflow-wrap: anywhere; }
+
+.check-notes {
+  grid-column: 2;
+  padding-top: 2px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.check-notes li { display: block; padding: 0; }
+.check-notes a { color: var(--accent-text); }
+.check-notes li::before { content: "– "; }
+
+.check-notices li {
+  padding: 8px 12px;
+  margin-top: 6px;
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  border-radius: var(--radius);
+  line-height: 1.45;
+}
+
+@media (max-width: 720px) {
+  .check { padding: 14px 16px 24px; }
+  .check-clients li { grid-template-columns: 1fr; }
+  .check-notes { grid-column: 1; }
 }

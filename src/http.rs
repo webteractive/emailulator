@@ -1,4 +1,7 @@
 //! The HTTP side: REST API, live events, the MCP endpoint and the web UI.
+//!
+//! Every request is resolved to an [`Access`] before it reaches a handler: the
+//! admin token opens everything, an inbox's API key opens that inbox alone.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -12,8 +15,8 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::routing::{delete, get, post};
+use axum::{Extension, Json, Router};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -27,8 +30,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::compose::SendRequest;
 use crate::mcp::Mcp;
 use crate::model::{ListFilter, Source};
-use crate::security::Auth;
-use crate::store::{Incoming, Store};
+use crate::security::{Access, Auth};
+use crate::store::{DEFAULT_INBOX, InboxError, Incoming, Store};
 
 const SESSION_COOKIE: &str = "emailulator_session";
 const LOGIN_FAILURE_DELAY: Duration = Duration::from_millis(750);
@@ -61,6 +64,7 @@ pub struct ServerInfo {
     pub version: &'static str,
     pub smtp_port: u16,
     pub smtp_starttls: bool,
+    /// Whether SMTP clients must authenticate with an inbox id and API key.
     pub smtp_auth_required: bool,
     pub http_tls: bool,
     pub auth_required: bool,
@@ -69,7 +73,7 @@ pub struct ServerInfo {
 }
 
 pub struct HttpConfig {
-    pub auth: Option<Arc<Auth>>,
+    pub auth: Arc<Auth>,
     pub info: ServerInfo,
     /// Serve the web UI. The API and MCP endpoint are served either way.
     pub ui: bool,
@@ -105,6 +109,13 @@ impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
     }
+
+    fn admin_only() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "this needs the admin token; an inbox API key reaches only its own inbox's messages",
+        )
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -115,7 +126,18 @@ impl IntoResponse for ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(error: anyhow::Error) -> Self {
-        // The cause goes to the log, not to the caller.
+        // A refused inbox operation is the caller's to fix, and says how.
+        if let Some(refused) = error.downcast_ref::<InboxError>() {
+            let status = match refused {
+                InboxError::InvalidId(_) | InboxError::InvalidName | InboxError::WeakKey => {
+                    StatusCode::BAD_REQUEST
+                }
+                InboxError::Exists(_) | InboxError::Protected => StatusCode::CONFLICT,
+                InboxError::NotFound(_) => StatusCode::NOT_FOUND,
+            };
+            return Self::new(status, refused.to_string());
+        }
+        // Anything else is ours; the cause goes to the log, not to the caller.
         tracing::error!(%error, "request failed");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
     }
@@ -151,7 +173,20 @@ pub fn router(store: Arc<Store>, config: HttpConfig) -> Router {
             get(session_status).post(session_open).delete(session_close),
         )
         .route("/api/v1/info", get(info))
-        .route("/api/v1/mailboxes", get(mailboxes))
+        .route("/api/v1/inboxes", get(list_inboxes).post(create_inbox))
+        .route(
+            "/api/v1/inboxes/{inbox}",
+            get(get_inbox).patch(update_inbox).delete(delete_inbox),
+        )
+        .route(
+            "/api/v1/inboxes/{inbox}/keys",
+            get(list_keys).post(create_key),
+        )
+        .route("/api/v1/inboxes/{inbox}/keys/{key}", delete(revoke_key))
+        .route(
+            "/api/v1/inboxes/{inbox}/keys/{key}/regenerate",
+            post(regenerate_key),
+        )
         .route("/api/v1/events", get(events))
         .route(
             "/api/v1/messages",
@@ -169,6 +204,7 @@ pub fn router(store: Arc<Store>, config: HttpConfig) -> Router {
         .route("/api/v1/messages/{id}/raw", get(message_raw))
         .route("/api/v1/messages/{id}/html", get(message_html))
         .route("/api/v1/messages/{id}/links", get(message_links))
+        .route("/api/v1/messages/{id}/check", get(message_check))
         .route(
             "/api/v1/messages/{id}/attachments/{index}",
             get(message_attachment),
@@ -210,9 +246,34 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .then_some(token.trim())
 }
 
-fn authenticated(auth: &Auth, headers: &HeaderMap) -> bool {
-    bearer_token(headers).is_some_and(|token| auth.token_matches(token))
-        || session_cookie(headers).is_some_and(|id| auth.session_valid(id))
+/// What a secret opens: the admin token everything, an inbox's key that inbox.
+async fn access_for_secret(state: &Shared, secret: &str) -> ApiResult<Option<Access>> {
+    if state.config.auth.is_admin_token(secret) {
+        return Ok(Some(Access::Admin));
+    }
+    let secret = secret.to_string();
+    let inbox = store(state, move |s| s.inbox_for_key(&secret)).await?;
+    Ok(inbox.map(Access::Inbox))
+}
+
+/// Who is asking. `None` means nobody the server recognizes.
+async fn resolve(state: &Shared, headers: &HeaderMap) -> ApiResult<Option<Access>> {
+    // A credential that was presented and is wrong is refused even where none
+    // is needed: falling back to open access would hide a revoked key.
+    if let Some(token) = bearer_token(headers) {
+        return access_for_secret(state, token).await;
+    }
+    if let Some(access) = session_cookie(headers).and_then(|id| state.config.auth.session(id)) {
+        // A session outlives the request that opened it, so check that the
+        // inbox it is confined to is still there.
+        if let Some(inbox) = access.inbox().map(str::to_string)
+            && !store(state, move |s| s.inbox_exists(&inbox)).await?
+        {
+            return Ok(None);
+        }
+        return Ok(Some(access));
+    }
+    Ok((!state.config.auth.required()).then_some(Access::Admin))
 }
 
 /// The host of a `Host` header or an origin's authority, without the port.
@@ -262,18 +323,20 @@ fn forbidden(message: &str) -> Response {
     ApiError::new(StatusCode::FORBIDDEN, message).into_response()
 }
 
-async fn guard(State(state): State<Shared>, request: Request, next: Next) -> Response {
+async fn guard(State(state): State<Shared>, mut request: Request, next: Next) -> Response {
     let headers = request.headers();
     let path = request.uri().path().to_string();
     let host = header_str(headers, header::HOST).unwrap_or_default();
-
-    // With no token and a loopback listener, the only thing keeping a web page
-    // out is the same-origin policy, and DNS rebinding walks around that by
-    // pointing its own hostname at 127.0.0.1. Such a request still carries the
-    // page's hostname, so only names that mean "this machine" are served.
     let https = is_https(&state, headers);
+    let protected = (path.starts_with("/api/") || path == "/mcp") && path != "/api/v1/session";
+
+    // With no admin token and a loopback listener, the only thing keeping a web
+    // page out is the same-origin policy, and DNS rebinding walks around that
+    // by pointing its own hostname at 127.0.0.1. Such a request still carries
+    // the page's hostname, so only names that mean "this machine" are served.
     let mut response =
-        if state.config.auth.is_none() && state.config.loopback && !is_local_name(hostname(host)) {
+        if !state.config.auth.required() && state.config.loopback && !is_local_name(hostname(host))
+        {
             forbidden(
                 "this server has no auth token, so it only answers to localhost; \
              set an auth token to reach it by another name",
@@ -286,20 +349,23 @@ async fn guard(State(state): State<Shared>, request: Request, next: Next) -> Res
         {
             // A state-changing request a browser sent on behalf of another site.
             forbidden("cross-origin request refused")
-        } else if (path.starts_with("/api/") || path == "/mcp")
-            && path != "/api/v1/session"
-            && state
-                .config
-                .auth
-                .as_ref()
-                .is_some_and(|auth| !authenticated(auth, headers))
-        {
-            let mut response =
-                ApiError::new(StatusCode::UNAUTHORIZED, "authentication required").into_response();
-            response
-                .headers_mut()
-                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-            response
+        } else if protected {
+            match resolve(&state, headers).await {
+                Ok(Some(access)) => {
+                    request.extensions_mut().insert(access);
+                    next.run(request).await
+                }
+                Ok(None) => {
+                    let mut response =
+                        ApiError::new(StatusCode::UNAUTHORIZED, "authentication required")
+                            .into_response();
+                    response
+                        .headers_mut()
+                        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+                    response
+                }
+                Err(error) => error.into_response(),
+            }
         } else {
             next.run(request).await
         };
@@ -326,18 +392,71 @@ async fn guard(State(state): State<Shared>, request: Request, next: Next) -> Res
     response
 }
 
+fn require_admin(access: &Access) -> ApiResult<()> {
+    match access {
+        Access::Admin => Ok(()),
+        Access::Inbox(_) => Err(ApiError::admin_only()),
+    }
+}
+
+/// The inbox a request is about: the caller's own if it is confined to one,
+/// otherwise the one it names, or all of them when it names none.
+async fn scope(
+    state: &Shared,
+    access: &Access,
+    requested: Option<String>,
+) -> ApiResult<Option<String>> {
+    match (access, requested) {
+        (Access::Inbox(own), Some(other)) if *own != other => Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            format!("this API key is for the `{own}` inbox, not `{other}`"),
+        )),
+        (Access::Inbox(own), _) => Ok(Some(own.clone())),
+        (Access::Admin, None) => Ok(None),
+        (Access::Admin, Some(inbox)) => {
+            let name = inbox.clone();
+            if store(state, move |s| s.inbox_exists(&name)).await? {
+                Ok(Some(inbox))
+            } else {
+                Err(ApiError::from(anyhow::Error::from(InboxError::NotFound(
+                    inbox,
+                ))))
+            }
+        }
+    }
+}
+
+/// Refuse a message outside the caller's inbox, in the same words as a message
+/// that does not exist: a key must not learn what other inboxes hold.
+async fn authorize(state: &Shared, access: &Access, id: i64) -> ApiResult<()> {
+    if let Access::Inbox(own) = access {
+        let owner = store(state, move |s| s.message_inbox(id)).await?;
+        if owner.as_deref() != Some(own.as_str()) {
+            return Err(ApiError::not_found(format_args!("message {id}")));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Sessions
 // ---------------------------------------------------------------------------
 
-async fn session_status(State(state): State<Shared>, headers: HeaderMap) -> Json<Value> {
-    let required = state.config.auth.is_some();
-    let authenticated = state
-        .config
-        .auth
-        .as_ref()
-        .is_none_or(|auth| authenticated(auth, &headers));
-    Json(json!({"auth_required": required, "authenticated": authenticated}))
+fn describe(access: Option<&Access>) -> Value {
+    match access {
+        Some(Access::Admin) => json!({"authenticated": true, "access": "admin", "inbox": null}),
+        Some(Access::Inbox(inbox)) => {
+            json!({"authenticated": true, "access": "inbox", "inbox": inbox})
+        }
+        None => json!({"authenticated": false, "access": null, "inbox": null}),
+    }
+}
+
+async fn session_status(State(state): State<Shared>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    let access = resolve(&state, &headers).await?;
+    let mut status = describe(access.as_ref());
+    status["auth_required"] = json!(state.config.auth.required());
+    Ok(Json(status))
 }
 
 #[derive(Deserialize)]
@@ -353,24 +472,25 @@ fn cookie(value: &str, max_age: u64, secure: bool) -> HeaderValue {
     HeaderValue::from_str(&cookie).expect("session ids are ASCII")
 }
 
+/// Sign the web UI in with the admin token, or with an inbox's API key for a
+/// view of that inbox alone.
 async fn session_open(
     State(state): State<Shared>,
     headers: HeaderMap,
     Json(login): Json<Login>,
 ) -> ApiResult<Response> {
-    let Some(auth) = &state.config.auth else {
-        return Ok(Json(json!({"authenticated": true})).into_response());
-    };
-    if !auth.token_matches(login.token.trim()) {
+    let Some(access) = access_for_secret(&state, login.token.trim()).await? else {
         tracing::warn!("web UI sign-in failed");
         tokio::time::sleep(LOGIN_FAILURE_DELAY).await;
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
-            "that token is not right",
+            "that is neither the admin token nor an inbox API key",
         ));
-    }
-    let id = auth.open_session();
-    let mut response = Json(json!({"authenticated": true})).into_response();
+    };
+    let auth = &state.config.auth;
+    let body = describe(Some(&access));
+    let id = auth.open_session(access);
+    let mut response = Json(body).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         cookie(
@@ -383,8 +503,8 @@ async fn session_open(
 }
 
 async fn session_close(State(state): State<Shared>, headers: HeaderMap) -> Response {
-    if let (Some(auth), Some(id)) = (&state.config.auth, session_cookie(&headers)) {
-        auth.close_session(id);
+    if let Some(id) = session_cookie(&headers) {
+        state.config.auth.close_session(id);
     }
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
@@ -395,25 +515,232 @@ async fn session_close(State(state): State<Shared>, headers: HeaderMap) -> Respo
 }
 
 // ---------------------------------------------------------------------------
-// API
+// Inboxes and keys
 // ---------------------------------------------------------------------------
 
-async fn info(State(state): State<Shared>) -> ApiResult<Json<Value>> {
-    let stats = store(&state, |s| s.stats()).await?;
+async fn info(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+) -> ApiResult<Json<Value>> {
+    let own = access.inbox().map(str::to_string);
+    let stats = store(&state, move |s| s.stats(own.as_deref())).await?;
     let mut info = serde_json::to_value(&state.config.info).map_err(anyhow::Error::from)?;
     info["stats"] = json!(stats);
+    info["access"] = describe(Some(&access))["access"].clone();
+    info["inbox"] = json!(access.inbox());
     Ok(Json(info))
 }
 
-async fn mailboxes(State(state): State<Shared>) -> ApiResult<Json<Value>> {
-    let mailboxes = store(&state, |s| s.mailboxes()).await?;
-    let stats = store(&state, |s| s.stats()).await?;
-    Ok(Json(json!({"mailboxes": mailboxes, "stats": stats})))
+/// Every inbox for the admin; a key sees its own.
+async fn list_inboxes(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+) -> ApiResult<Json<Value>> {
+    let own = access.inbox().map(str::to_string);
+    let (inboxes, stats) = store(&state, move |s| {
+        let mut inboxes = s.inboxes()?;
+        if let Some(own) = &own {
+            inboxes.retain(|inbox| &inbox.id == own);
+        }
+        Ok((inboxes, s.stats(own.as_deref())?))
+    })
+    .await?;
+    Ok(Json(json!({"inboxes": inboxes, "stats": stats})))
 }
 
 #[derive(Deserialize)]
-struct ListQuery {
-    mailbox: Option<String>,
+struct NewInbox {
+    /// What people will call the inbox. Required unless `id` is given, in
+    /// which case the inbox is named after its id.
+    name: Option<String>,
+    #[serde(default)]
+    description: String,
+    /// Normally left out and generated. A client that showed the user an id
+    /// and key before creating the inbox sends them, to get exactly those.
+    id: Option<String>,
+    key: Option<String>,
+    /// Create nothing: answer with the id this name would get and a fresh key,
+    /// for a form that shows both before the inbox exists.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Create an inbox. It comes with a first API key, returned here and only here.
+async fn create_inbox(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Json(new): Json<NewInbox>,
+) -> ApiResult<Response> {
+    require_admin(&access)?;
+    let Some(name) = new.name.clone().or_else(|| new.id.clone()) else {
+        return Err(ApiError::bad_request("an inbox needs a `name`"));
+    };
+    if new.dry_run {
+        let id = store(&state, move |s| s.suggest_inbox_id(&name)).await?;
+        let preview = json!({"id": id, "key": crate::security::generate_api_key()});
+        return Ok(Json(preview).into_response());
+    }
+    let draft = crate::store::NewInbox {
+        name,
+        description: new.description,
+        id: new.id,
+        key: new.key,
+    };
+    let (inbox, key) = store(&state, move |s| s.create_inbox_named(draft)).await?;
+    tracing::info!(inbox = %inbox.id, name = %inbox.name, "inbox created");
+    let mut body = serde_json::to_value(&inbox).map_err(anyhow::Error::from)?;
+    body["key"] = json!(key);
+    Ok((StatusCode::CREATED, Json(body)).into_response())
+}
+
+#[derive(Deserialize)]
+struct InboxChanges {
+    name: Option<String>,
+    description: Option<String>,
+}
+
+/// Rename an inbox or change its description. Its id, and so what
+/// applications sign in with, stays as it is.
+async fn update_inbox(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(inbox): Path<String>,
+    Json(changes): Json<InboxChanges>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&access)?;
+    if changes.name.is_none() && changes.description.is_none() {
+        return Err(ApiError::bad_request("give `name`, `description`, or both"));
+    }
+    let updated = store(&state, move |s| {
+        s.update_inbox(
+            &inbox,
+            changes.name.as_deref(),
+            changes.description.as_deref(),
+        )
+    })
+    .await?;
+    Ok(Json(json!(updated)))
+}
+
+async fn get_inbox(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(inbox): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let inbox = scope(&state, &access, Some(inbox))
+        .await?
+        .unwrap_or_default();
+    let found = store(&state, move |s| s.inbox(&inbox)).await?;
+    Ok(Json(json!(found)))
+}
+
+async fn delete_inbox(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(inbox): Path<String>,
+) -> ApiResult<StatusCode> {
+    require_admin(&access)?;
+    let name = inbox.clone();
+    store(&state, move |s| s.delete_inbox(&name)).await?;
+    state.config.auth.close_inbox_sessions(&inbox);
+    tracing::info!(%inbox, "inbox deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_keys(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(inbox): Path<String>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&access)?;
+    let inbox = scope(&state, &access, Some(inbox)).await?;
+    let keys = store(&state, move |s| s.keys(inbox.as_deref())).await?;
+    Ok(Json(json!({"keys": keys})))
+}
+
+#[derive(Deserialize, Default)]
+struct NewKey {
+    #[serde(default)]
+    label: String,
+}
+
+/// Mint a key. The response is the only time the key itself is ever shown.
+async fn create_key(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(inbox): Path<String>,
+    body: Bytes,
+) -> ApiResult<Response> {
+    require_admin(&access)?;
+    // The body is optional: a key needs no label.
+    let new: NewKey = if body.iter().all(u8::is_ascii_whitespace) {
+        NewKey::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| ApiError::bad_request(format!("invalid body: {e}")))?
+    };
+    let (record, key) = store(&state, move |s| s.create_key(&inbox, &new.label)).await?;
+    tracing::info!(inbox = %record.inbox, key = record.id, "API key created");
+    let mut body = serde_json::to_value(&record).map_err(anyhow::Error::from)?;
+    body["key"] = json!(key);
+    Ok((StatusCode::CREATED, Json(body)).into_response())
+}
+
+/// Replace a key's value. The old one stops working at once; the response is
+/// the only time the new one is shown.
+async fn regenerate_key(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path((inbox, key)): Path<(String, i64)>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&access)?;
+    let name = inbox.clone();
+    let Some((record, value)) = store(&state, move |s| s.regenerate_key(key, Some(&name))).await?
+    else {
+        return Err(ApiError::not_found(format_args!(
+            "key {key} of inbox `{inbox}`"
+        )));
+    };
+    // A browser signed in with the old value holds a session, not the key.
+    state.config.auth.close_inbox_sessions(&inbox);
+    tracing::info!(%inbox, key, "API key regenerated");
+    let mut body = serde_json::to_value(&record).map_err(anyhow::Error::from)?;
+    body["key"] = json!(value);
+    Ok(Json(body))
+}
+
+async fn revoke_key(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path((inbox, key)): Path<(String, i64)>,
+) -> ApiResult<StatusCode> {
+    require_admin(&access)?;
+    let name = inbox.clone();
+    if !store(&state, move |s| s.revoke_key(key, Some(&name))).await? {
+        return Err(ApiError::not_found(format_args!(
+            "key {key} of inbox `{inbox}`"
+        )));
+    }
+    // A browser signed in with the key holds a session, not the key; end those
+    // too, or revoking would not lock it out.
+    state.config.auth.close_inbox_sessions(&inbox);
+    tracing::info!(%inbox, key, "API key revoked");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+/// Which messages a request is about. Unknown parameters are refused rather
+/// than ignored: a misspelled filter on a bulk delete would otherwise widen it
+/// to everything.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct Selection {
+    inbox: Option<String>,
+    /// An exact envelope recipient.
+    to: Option<String>,
     q: Option<String>,
     unread: Option<bool>,
     starred: Option<bool>,
@@ -423,26 +750,34 @@ struct ListQuery {
     limit: Option<usize>,
 }
 
+async fn filter(state: &Shared, access: &Access, selection: Selection) -> ApiResult<ListFilter> {
+    Ok(ListFilter {
+        inbox: scope(state, access, selection.inbox).await?,
+        to: selection.to,
+        query: selection.q,
+        unread: selection.unread,
+        starred: selection.starred,
+        before_id: selection.before,
+        after_id: selection.after,
+        since: selection.since,
+        limit: selection.limit,
+    })
+}
+
 async fn list_messages(
     State(state): State<Shared>,
-    Query(query): Query<ListQuery>,
+    Extension(access): Extension<Access>,
+    Query(selection): Query<Selection>,
 ) -> ApiResult<Json<Value>> {
-    let filter = ListFilter {
-        mailbox: query.mailbox,
-        query: query.q,
-        unread: query.unread,
-        starred: query.starred,
-        before_id: query.before,
-        after_id: query.after,
-        since: query.since,
-        limit: query.limit,
-    };
+    let filter = filter(&state, &access, selection).await?;
     let page = store(&state, move |s| s.list(&filter)).await?;
     Ok(Json(json!(page)))
 }
 
 #[derive(Deserialize)]
-struct RawEnvelope {
+struct Delivery {
+    /// The inbox to deliver into, for a caller not confined to one.
+    inbox: Option<String>,
     from: Option<String>,
     /// Comma-separated envelope recipients.
     to: Option<String>,
@@ -450,10 +785,14 @@ struct RawEnvelope {
 
 async fn send_message(
     State(state): State<Shared>,
-    Query(envelope): Query<RawEnvelope>,
+    Extension(access): Extension<Access>,
+    Query(delivery): Query<Delivery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Response> {
+    let inbox = scope(&state, &access, delivery.inbox)
+        .await?
+        .unwrap_or_else(|| DEFAULT_INBOX.to_string());
     let is_json = header_str(&headers, header::CONTENT_TYPE)
         .is_some_and(|t| t.to_ascii_lowercase().starts_with("application/json"));
 
@@ -461,7 +800,7 @@ async fn send_message(
         let request: SendRequest = serde_json::from_slice(&body)
             .map_err(|e| ApiError::bad_request(format!("invalid message: {e}")))?;
         request
-            .build()
+            .build(&inbox)
             .map_err(|e| ApiError::bad_request(e.to_string()))?
     } else {
         // Anything else is taken as a complete RFC 5322 message.
@@ -472,8 +811,9 @@ async fn send_message(
         }
         Incoming {
             raw: body.to_vec(),
-            envelope_from: envelope.from,
-            envelope_to: envelope
+            inbox,
+            envelope_from: delivery.from,
+            envelope_to: delivery
                 .to
                 .map(|to| {
                     to.split(',')
@@ -499,16 +839,12 @@ async fn send_message(
     let summary = store(&state, move |s| s.insert(incoming)).await?;
     tracing::info!(
         id = summary.id,
-        recipients = summary.mailboxes.len(),
+        inbox = %summary.inbox,
+        recipients = summary.recipients.len(),
         size = summary.size,
         "message received over the API"
     );
     Ok((StatusCode::CREATED, Json(summary)).into_response())
-}
-
-#[derive(Deserialize)]
-struct MailboxQuery {
-    mailbox: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -517,9 +853,11 @@ struct Flags {
     starred: Option<bool>,
 }
 
+/// Mark read everything the query selects.
 async fn update_messages(
     State(state): State<Shared>,
-    Query(query): Query<MailboxQuery>,
+    Extension(access): Extension<Access>,
+    Query(selection): Query<Selection>,
     Json(flags): Json<Flags>,
 ) -> ApiResult<Json<Value>> {
     if flags.read != Some(true) || flags.starred.is_some() {
@@ -527,19 +865,29 @@ async fn update_messages(
             "the only bulk update is {\"read\": true}; flag single messages by id",
         ));
     }
-    let updated = store(&state, move |s| s.mark_all_read(query.mailbox.as_deref())).await?;
+    let filter = filter(&state, &access, selection).await?;
+    let updated = store(&state, move |s| s.mark_all_read(&filter)).await?;
     Ok(Json(json!({"updated": updated})))
 }
 
+/// Delete everything the query selects: an inbox, a search within one, or,
+/// for the admin with no filter at all, every message there is.
 async fn delete_messages(
     State(state): State<Shared>,
-    Query(query): Query<MailboxQuery>,
+    Extension(access): Extension<Access>,
+    Query(selection): Query<Selection>,
 ) -> ApiResult<Json<Value>> {
-    let deleted = store(&state, move |s| s.clear(query.mailbox.as_deref())).await?;
+    let filter = filter(&state, &access, selection).await?;
+    let deleted = store(&state, move |s| s.clear(&filter)).await?;
     Ok(Json(json!({"deleted": deleted})))
 }
 
-async fn get_message(State(state): State<Shared>, Path(id): Path<i64>) -> ApiResult<Json<Value>> {
+async fn get_message(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Value>> {
+    authorize(&state, &access, id).await?;
     let detail = store(&state, move |s| s.get(id))
         .await?
         .ok_or_else(|| ApiError::not_found(format_args!("message {id}")))?;
@@ -548,12 +896,14 @@ async fn get_message(State(state): State<Shared>, Path(id): Path<i64>) -> ApiRes
 
 async fn update_message(
     State(state): State<Shared>,
+    Extension(access): Extension<Access>,
     Path(id): Path<i64>,
     Json(flags): Json<Flags>,
 ) -> ApiResult<Json<Value>> {
     if flags.read.is_none() && flags.starred.is_none() {
         return Err(ApiError::bad_request("give `read`, `starred`, or both"));
     }
+    authorize(&state, &access, id).await?;
     let summary = store(&state, move |s| {
         s.set_flags(id, flags.read, flags.starred)?;
         s.summary(id)
@@ -563,7 +913,12 @@ async fn update_message(
     Ok(Json(json!(summary)))
 }
 
-async fn delete_message(State(state): State<Shared>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
+async fn delete_message(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    authorize(&state, &access, id).await?;
     if store(&state, move |s| s.delete(id)).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -600,7 +955,12 @@ fn attachment_disposition(filename: &str) -> HeaderValue {
     .unwrap_or(HeaderValue::from_static("attachment"))
 }
 
-async fn message_raw(State(state): State<Shared>, Path(id): Path<i64>) -> ApiResult<Response> {
+async fn message_raw(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    authorize(&state, &access, id).await?;
     let raw = store(&state, move |s| s.raw(id))
         .await?
         .ok_or_else(|| ApiError::not_found(format_args!("message {id}")))?;
@@ -630,7 +990,12 @@ fn escape_html(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
-async fn message_html(State(state): State<Shared>, Path(id): Path<i64>) -> ApiResult<Response> {
+async fn message_html(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    authorize(&state, &access, id).await?;
     let html = match store(&state, move |s| s.rendered_html(id)).await? {
         Some(html) => html,
         // No HTML part: show the text the way a mail client would.
@@ -664,17 +1029,54 @@ async fn message_html(State(state): State<Shared>, Path(id): Path<i64>) -> ApiRe
         .into_response())
 }
 
-async fn message_links(State(state): State<Shared>, Path(id): Path<i64>) -> ApiResult<Json<Value>> {
+async fn message_links(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Value>> {
+    authorize(&state, &access, id).await?;
     let links = store(&state, move |s| s.links(id))
         .await?
         .ok_or_else(|| ApiError::not_found(format_args!("message {id}")))?;
     Ok(Json(json!({"links": links})))
 }
 
+#[derive(Deserialize)]
+struct CheckQuery {
+    /// Comma-separated client families to check against; all of them otherwise.
+    clients: Option<String>,
+}
+
+/// Which email clients will render the message as written.
+async fn message_check(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(id): Path<i64>,
+    Query(query): Query<CheckQuery>,
+) -> ApiResult<Json<Value>> {
+    authorize(&state, &access, id).await?;
+    let only: Option<Vec<String>> = query.clients.map(|clients| {
+        clients
+            .split(',')
+            .map(|c| c.trim().to_ascii_lowercase())
+            .filter(|c| !c.is_empty())
+            .collect()
+    });
+    let report = store(&state, move |s| {
+        Ok(s.get(id)?
+            .map(|detail| crate::check::check(&detail, only.as_deref())))
+    })
+    .await?
+    .ok_or_else(|| ApiError::not_found(format_args!("message {id}")))?;
+    Ok(Json(json!(report)))
+}
+
 async fn message_attachment(
     State(state): State<Shared>,
+    Extension(access): Extension<Access>,
     Path((id, index)): Path<(i64, usize)>,
 ) -> ApiResult<Response> {
+    authorize(&state, &access, id).await?;
     let (meta, bytes) = store(&state, move |s| s.attachment(id, index))
         .await?
         .ok_or_else(|| ApiError::not_found(format_args!("attachment {index} of message {id}")))?;
@@ -704,18 +1106,27 @@ async fn message_attachment(
 
 async fn events(
     State(state): State<Shared>,
+    Extension(access): Extension<Access>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
-    let stream = BroadcastStream::new(state.store.subscribe()).map(|event| {
-        Ok(match event {
-            Ok(event) => SseEvent::default().json_data(&event).unwrap_or_default(),
+    let stream = BroadcastStream::new(state.store.subscribe()).filter_map(move |event| {
+        Some(Ok(match event {
+            // A viewer confined to one inbox hears only of that inbox.
+            Ok(event) if access.inbox().is_none_or(|inbox| event.concerns(inbox)) => {
+                SseEvent::default().json_data(&event).unwrap_or_default()
+            }
+            Ok(_) => return None,
             // The viewer fell behind and missed events; tell it to reload.
             Err(_) => SseEvent::default().data(r#"{"type":"resync"}"#),
-        })
+        }))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-async fn mcp(State(state): State<Shared>, body: Bytes) -> Response {
+async fn mcp(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    body: Bytes,
+) -> Response {
     let message: Value = match serde_json::from_slice(&body) {
         Ok(message) => message,
         Err(error) => {
@@ -724,7 +1135,7 @@ async fn mcp(State(state): State<Shared>, body: Bytes) -> Response {
             return (StatusCode::BAD_REQUEST, Json(reply)).into_response();
         }
     };
-    match state.mcp.handle(message).await {
+    match state.mcp.handle(message, &access).await {
         Some(reply) => Json(reply).into_response(),
         None => StatusCode::ACCEPTED.into_response(),
     }
@@ -834,6 +1245,817 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    fn app(token: Option<&str>, loopback: bool) -> (Router, Arc<Store>) {
+        let store = Arc::new(Store::in_memory().unwrap());
+        let config = HttpConfig {
+            auth: Arc::new(Auth::new(token.map(str::to_string)).unwrap()),
+            info: ServerInfo {
+                name: "emailulator",
+                version: "test",
+                smtp_port: 1025,
+                smtp_starttls: false,
+                smtp_auth_required: false,
+                http_tls: false,
+                auth_required: token.is_some(),
+                max_message_size: 4096,
+                max_messages: 100,
+            },
+            ui: true,
+            loopback,
+        };
+        (router(store.clone(), config), store)
+    }
+
+    fn request(method: &str, uri: &str) -> axum::http::request::Builder {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "localhost:8025")
+    }
+
+    fn with_key(method: &str, uri: &str, key: &str) -> axum::http::request::Builder {
+        request(method, uri).header("authorization", format!("Bearer {key}"))
+    }
+
+    fn empty(builder: axum::http::request::Builder) -> axum::http::Request<Body> {
+        builder.body(Body::empty()).unwrap()
+    }
+
+    fn json_request(
+        builder: axum::http::request::Builder,
+        value: Value,
+    ) -> axum::http::Request<Body> {
+        builder
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&value).unwrap()))
+            .unwrap()
+    }
+
+    async fn send(
+        app: &Router,
+        request: axum::http::Request<Body>,
+    ) -> (StatusCode, HeaderMap, String) {
+        let response = app.clone().oneshot(request).await.unwrap();
+        let (parts, body) = response.into_parts();
+        let bytes = to_bytes(body, usize::MAX).await.unwrap();
+        (
+            parts.status,
+            parts.headers,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
+    }
+
+    async fn json(app: &Router, request: axum::http::Request<Body>) -> (StatusCode, Value) {
+        let (status, _, body) = send(app, request).await;
+        (status, serde_json::from_str(&body).unwrap_or(Value::Null))
+    }
+
+    fn sample() -> Value {
+        json!({
+            "from": "app@x.test", "to": "bob@x.test", "subject": "Hello",
+            "html": "<p>Hi<script>alert(1)</script></p>",
+            "attachments": [{"filename": "evil.html", "content": "PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg=="}],
+        })
+    }
+
+    /// Deliver the sample message, as `key` if one is given, and return its id.
+    async fn seed(app: &Router, uri: &str, key: Option<&str>) -> i64 {
+        let builder = match key {
+            Some(key) => with_key("POST", uri, key),
+            None => request("POST", uri),
+        };
+        let (status, body) = json(app, json_request(builder, sample())).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        body["id"].as_i64().unwrap()
+    }
+
+    #[tokio::test]
+    async fn api_round_trip_without_auth() {
+        let (app, _) = app(None, true);
+        let id = seed(&app, "/api/v1/messages", None).await;
+
+        let (status, page) = json(
+            &app,
+            empty(request("GET", "/api/v1/messages?to=bob@x.test")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["messages"][0]["subject"], "Hello");
+        assert_eq!(
+            page["messages"][0]["inbox"], "default",
+            "mail with no key goes to the default inbox"
+        );
+
+        let patch = json_request(
+            request("PATCH", &format!("/api/v1/messages/{id}")),
+            json!({"read": true, "starred": true}),
+        );
+        let (status, summary) = json(&app, patch).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(summary["starred"], true);
+
+        let (status, _, _) = send(
+            &app,
+            empty(request("DELETE", &format!("/api/v1/messages/{id}"))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _, _) = send(
+            &app,
+            empty(request("GET", &format!("/api/v1/messages/{id}"))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn accepts_a_raw_message_with_an_envelope() {
+        let (app, store) = app(None, true);
+        let raw = "From: a@x.test\r\nTo: shown@x.test\r\nSubject: Raw\r\n\r\nbody\r\n";
+        let post = request(
+            "POST",
+            "/api/v1/messages?from=bounce@x.test&to=one@x.test,two@x.test",
+        )
+        .header("content-type", "message/rfc822")
+        .body(Body::from(raw))
+        .unwrap();
+        let (status, _, body) = send(&app, post).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let detail = store.get(1).unwrap().unwrap();
+        assert_eq!(detail.summary.recipients, vec!["one@x.test", "two@x.test"]);
+        assert_eq!(detail.envelope_from.as_deref(), Some("bounce@x.test"));
+
+        let big = request("POST", "/api/v1/messages")
+            .header("content-type", "message/rfc822")
+            .body(Body::from(vec![b'x'; 5000]))
+            .unwrap();
+        assert_eq!(send(&app, big).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn the_admin_manages_inboxes_and_their_keys() {
+        let (app, _) = app(Some(TOKEN), false);
+        let admin = |method: &str, uri: &str| with_key(method, uri, TOKEN);
+        let create = |body: Value| json_request(admin("POST", "/api/v1/inboxes"), body);
+
+        // A name is all it takes; the id and first key are generated.
+        let (status, inbox) = json(
+            &app,
+            create(json!({"name": "Billing App", "description": "Invoices"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{inbox}");
+        let id = inbox["id"].as_str().unwrap().to_string();
+        assert_eq!(id, "billing-app", "made from the name");
+        assert_eq!(inbox["name"], "Billing App");
+        assert_eq!(inbox["description"], "Invoices");
+        assert_eq!(inbox["keys"], 1);
+        let first_key = inbox["key"].as_str().unwrap().to_string();
+        assert!(first_key.starts_with("emu_"));
+        assert_eq!(
+            send(&app, empty(with_key("GET", "/api/v1/messages", &first_key)))
+                .await
+                .0,
+            StatusCode::OK,
+            "the key it came with works at once"
+        );
+
+        let (status, error) = json(&app, create(json!({"name": "billing app"}))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{error}");
+        let (status, error) = json(&app, create(json!({"name": "   "}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        let (status, _) = json(&app, create(json!({"description": "no name"}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A form can ask what a name would get, without creating anything.
+        let (status, preview) = json(
+            &app,
+            create(json!({"name": "Billing App", "dry_run": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        assert_eq!(preview["id"], "billing-app-2", "the plain slug is taken");
+        assert!(preview["key"].as_str().unwrap().starts_with("emu_"));
+        let (_, listed) = json(&app, empty(admin("GET", "/api/v1/inboxes"))).await;
+        assert_eq!(
+            listed["inboxes"].as_array().unwrap().len(),
+            2,
+            "nothing was created"
+        );
+
+        // A client that showed the user an id and key first gets exactly those.
+        let shown = json!({"name": "Orders", "id": "ibx_00112233aa", "key": "emu_shown-to-the-user-already"});
+        let (status, orders) = json(&app, create(shown)).await;
+        assert_eq!(status, StatusCode::CREATED, "{orders}");
+        assert_eq!(orders["id"], "ibx_00112233aa");
+        assert_eq!(orders["key"], "emu_shown-to-the-user-already");
+        let (status, _) = json(&app, create(json!({"name": "Bad", "id": "Not Valid"}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Renaming keeps the id.
+        let rename = json_request(
+            admin("PATCH", &format!("/api/v1/inboxes/{id}")),
+            json!({"name": "Payments"}),
+        );
+        let (status, renamed) = json(&app, rename).await;
+        assert_eq!(status, StatusCode::OK, "{renamed}");
+        assert_eq!(
+            (renamed["id"].as_str(), renamed["name"].as_str()),
+            (Some(id.as_str()), Some("Payments"))
+        );
+
+        // Further keys are shown in full exactly once, at creation.
+        let keys_uri = format!("/api/v1/inboxes/{id}/keys");
+        let (status, created) = json(
+            &app,
+            json_request(admin("POST", &keys_uri), json!({"label": "laravel"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let key = created["key"].as_str().unwrap().to_string();
+        let (_, unlabeled) = json(&app, empty(admin("POST", &keys_uri))).await;
+        assert_eq!(
+            unlabeled["label"], "key",
+            "a label is optional: {unlabeled}"
+        );
+
+        let (status, _, listed) = send(&app, empty(admin("GET", &keys_uri))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(listed.contains("\"label\":\"laravel\""), "{listed}");
+        assert!(
+            !listed.contains(&key) && !listed.contains(&first_key),
+            "a listing never repeats a key"
+        );
+
+        let (_, all) = json(&app, empty(admin("GET", "/api/v1/inboxes"))).await;
+        let names: Vec<_> = all["inboxes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["name"].clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec![json!("Default"), json!("Orders"), json!("Payments")]
+        );
+        assert_eq!(all["inboxes"][2]["keys"], 3);
+
+        // Regenerating swaps the value under the same id and label.
+        let key_id = created["id"].as_i64().unwrap();
+        let regenerate = admin("POST", &format!("{keys_uri}/{key_id}/regenerate"));
+        let (status, renewed) = json(&app, empty(regenerate)).await;
+        assert_eq!(status, StatusCode::OK, "{renewed}");
+        assert_eq!(
+            (renewed["id"].as_i64(), renewed["label"].as_str()),
+            (Some(key_id), Some("laravel"))
+        );
+        let old = key;
+        let key = renewed["key"].as_str().unwrap().to_string();
+        assert_ne!(key, old);
+        assert_eq!(
+            send(&app, empty(with_key("GET", "/api/v1/messages", &old)))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let missing = admin("POST", &format!("{keys_uri}/9999/regenerate"));
+        assert_eq!(send(&app, empty(missing)).await.0, StatusCode::NOT_FOUND);
+
+        // Revoking a key locks it out; deleting the inbox takes the rest.
+        assert_eq!(
+            send(&app, empty(with_key("GET", "/api/v1/messages", &key)))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let revoke = admin("DELETE", &format!("{keys_uri}/{key_id}"));
+        assert_eq!(send(&app, empty(revoke)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            send(&app, empty(with_key("GET", "/api/v1/messages", &key)))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let delete = format!("/api/v1/inboxes/{id}");
+        assert_eq!(
+            send(&app, empty(admin("DELETE", &delete))).await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            send(&app, empty(admin("DELETE", &delete))).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            send(&app, empty(with_key("GET", "/api/v1/messages", &first_key)))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            send(&app, empty(admin("DELETE", "/api/v1/inboxes/default")))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    /// Two inboxes, a key for each, and one message in each.
+    async fn two_inboxes() -> (Router, Arc<Store>, String, String, i64, i64) {
+        let (app, store) = app(Some(TOKEN), false);
+        store.create_inbox("billing").unwrap();
+        store.create_inbox("marketing").unwrap();
+        let (_, billing) = store.create_key("billing", "app").unwrap();
+        let (_, marketing) = store.create_key("marketing", "site").unwrap();
+        let invoice = seed(&app, "/api/v1/messages", Some(&billing)).await;
+        let promo = seed(&app, "/api/v1/messages", Some(&marketing)).await;
+        (app, store, billing, marketing, invoice, promo)
+    }
+
+    #[tokio::test]
+    async fn an_inbox_key_delivers_into_and_reads_only_its_inbox() {
+        let (app, store, billing, _marketing, invoice, promo) = two_inboxes().await;
+        assert_eq!(
+            store.message_inbox(invoice).unwrap().as_deref(),
+            Some("billing")
+        );
+        assert_eq!(
+            store.message_inbox(promo).unwrap().as_deref(),
+            Some("marketing")
+        );
+
+        let (_, page) = json(&app, empty(with_key("GET", "/api/v1/messages", &billing))).await;
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["messages"][0]["id"], invoice);
+
+        // Its own inbox by name is fine; another's is refused, not emptied.
+        let own = with_key("GET", "/api/v1/messages?inbox=billing", &billing);
+        assert_eq!(send(&app, empty(own)).await.0, StatusCode::OK);
+        let other = with_key("GET", "/api/v1/messages?inbox=marketing", &billing);
+        assert_eq!(send(&app, empty(other)).await.0, StatusCode::FORBIDDEN);
+
+        // Another inbox's message looks exactly like one that does not exist.
+        for path in ["", "/raw", "/html", "/links", "/attachments/0"] {
+            let uri = format!("/api/v1/messages/{promo}{path}");
+            let (status, _, body) = send(&app, empty(with_key("GET", &uri, &billing))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+            assert!(
+                body.contains(&format!("message {promo} not found")),
+                "{body}"
+            );
+        }
+        let patch = json_request(
+            with_key("PATCH", &format!("/api/v1/messages/{promo}"), &billing),
+            json!({"read": true}),
+        );
+        assert_eq!(send(&app, patch).await.0, StatusCode::NOT_FOUND);
+        let delete = with_key("DELETE", &format!("/api/v1/messages/{promo}"), &billing);
+        assert_eq!(send(&app, empty(delete)).await.0, StatusCode::NOT_FOUND);
+        assert!(
+            !store.get(promo).unwrap().unwrap().summary.read,
+            "untouched"
+        );
+
+        // It sees one inbox, its own, and cannot manage any.
+        let (_, inboxes) = json(&app, empty(with_key("GET", "/api/v1/inboxes", &billing))).await;
+        assert_eq!(inboxes["inboxes"].as_array().unwrap().len(), 1);
+        assert_eq!(inboxes["inboxes"][0]["id"], "billing");
+        let (_, info) = json(&app, empty(with_key("GET", "/api/v1/info", &billing))).await;
+        assert_eq!(info["access"], "inbox");
+        assert_eq!(info["inbox"], "billing");
+        assert_eq!(info["stats"]["total"], 1, "counts are its own inbox's");
+        for (method, uri) in [
+            ("POST", "/api/v1/inboxes"),
+            ("PATCH", "/api/v1/inboxes/billing"),
+            ("DELETE", "/api/v1/inboxes/billing"),
+            ("GET", "/api/v1/inboxes/billing/keys"),
+            ("POST", "/api/v1/inboxes/billing/keys"),
+            ("DELETE", "/api/v1/inboxes/billing/keys/1"),
+            ("POST", "/api/v1/inboxes/billing/keys/1/regenerate"),
+        ] {
+            let request = json_request(with_key(method, uri, &billing), json!({"id": "x"}));
+            assert_eq!(
+                send(&app, request).await.0,
+                StatusCode::FORBIDDEN,
+                "{method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_changes_stay_inside_the_callers_inbox() {
+        let (app, store, billing, _marketing, _invoice, promo) = two_inboxes().await;
+
+        let read_all = json_request(
+            with_key("PATCH", "/api/v1/messages", &billing),
+            json!({"read": true}),
+        );
+        let (_, updated) = json(&app, read_all).await;
+        assert_eq!(updated["updated"], 1);
+        assert!(!store.get(promo).unwrap().unwrap().summary.read);
+
+        let (_, deleted) = json(
+            &app,
+            empty(with_key("DELETE", "/api/v1/messages", &billing)),
+        )
+        .await;
+        assert_eq!(deleted["deleted"], 1);
+        assert_eq!(
+            store.stats(None).unwrap().total,
+            1,
+            "marketing's mail is still there"
+        );
+
+        // A misspelled filter is refused instead of widening the delete.
+        let typo = with_key("DELETE", "/api/v1/messages?inbx=marketing", TOKEN);
+        assert_eq!(send(&app, empty(typo)).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(store.stats(None).unwrap().total, 1);
+
+        // The admin can aim at one inbox, or a search within everything.
+        let none = with_key(
+            "DELETE",
+            "/api/v1/messages?q=subject:nothing-matches",
+            TOKEN,
+        );
+        assert_eq!(json(&app, empty(none)).await.1["deleted"], 0);
+        let aimed = with_key("DELETE", "/api/v1/messages?inbox=marketing", TOKEN);
+        assert_eq!(json(&app, empty(aimed)).await.1["deleted"], 1);
+        let unknown = with_key("GET", "/api/v1/messages?inbox=nowhere", TOKEN);
+        assert_eq!(send(&app, empty(unknown)).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_token_gates_the_api_and_mcp_but_not_the_shell() {
+        let (app, _) = app(Some(TOKEN), false);
+
+        for path in [
+            "/api/v1/messages",
+            "/api/v1/info",
+            "/api/v1/events",
+            "/api/v1/inboxes",
+            "/api/v1/messages/1/raw",
+        ] {
+            let (status, headers, _) = send(&app, empty(request("GET", path))).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+            assert_eq!(headers["www-authenticate"], "Bearer");
+        }
+        let mcp = request("POST", "/mcp").body(Body::from("{}")).unwrap();
+        assert_eq!(send(&app, mcp).await.0, StatusCode::UNAUTHORIZED);
+
+        assert_eq!(
+            send(&app, empty(with_key("GET", "/api/v1/messages", "nope")))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            send(&app, empty(with_key("GET", "/api/v1/messages", TOKEN)))
+                .await
+                .0,
+            StatusCode::OK
+        );
+
+        // The static shell and the health probe carry no mail.
+        assert_eq!(
+            send(&app, empty(request("GET", "/"))).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(&app, empty(request("GET", "/healthz"))).await.0,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_key_is_refused_even_where_none_is_needed() {
+        let (app, store) = app(None, true);
+        store.create_inbox("billing").unwrap();
+        let (record, key) = store.create_key("billing", "app").unwrap();
+
+        // Open server: no credential is admin, a key confines the caller.
+        assert_eq!(
+            json(&app, empty(request("GET", "/api/v1/info"))).await.1["access"],
+            "admin"
+        );
+        assert_eq!(
+            json(&app, empty(with_key("GET", "/api/v1/info", &key)))
+                .await
+                .1["access"],
+            "inbox"
+        );
+
+        store.revoke_key(record.id, None).unwrap();
+        let revoked = with_key("GET", "/api/v1/info", &key);
+        assert_eq!(send(&app, empty(revoked)).await.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn the_ui_signs_in_with_a_cookie_and_out_again() {
+        let (app, _) = app(Some(TOKEN), false);
+        let login =
+            |token: &str| json_request(request("POST", "/api/v1/session"), json!({"token": token}));
+
+        let (status, headers, body) = send(&app, login(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"access\":\"admin\""), "{body}");
+        let set_cookie = headers["set-cookie"].to_str().unwrap().to_string();
+        assert!(
+            set_cookie.contains("HttpOnly") && set_cookie.contains("SameSite=Strict"),
+            "{set_cookie}"
+        );
+        assert!(
+            !set_cookie.contains(TOKEN),
+            "the cookie is a session id, not the token"
+        );
+        let cookie = set_cookie.split(';').next().unwrap().to_string();
+
+        let with_cookie = |method: &str, path: &str| {
+            empty(request(method, path).header("cookie", cookie.clone()))
+        };
+        assert_eq!(
+            send(&app, with_cookie("GET", "/api/v1/messages")).await.0,
+            StatusCode::OK
+        );
+        let (_, status_body) = json(&app, with_cookie("GET", "/api/v1/session")).await;
+        assert_eq!(status_body["authenticated"], true);
+        assert_eq!(status_body["auth_required"], true);
+
+        assert_eq!(
+            send(&app, with_cookie("DELETE", "/api/v1/session")).await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            send(&app, with_cookie("GET", "/api/v1/messages")).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let secure = json_request(
+            request("POST", "/api/v1/session").header("x-forwarded-proto", "https"),
+            json!({"token": TOKEN}),
+        );
+        let (_, headers, _) = send(&app, secure).await;
+        assert!(headers["set-cookie"].to_str().unwrap().contains("; Secure"));
+        assert!(headers.contains_key("strict-transport-security"));
+    }
+
+    #[tokio::test]
+    async fn signing_in_with_an_inbox_key_shows_that_inbox_until_the_key_is_revoked() {
+        let (app, _store, billing, _marketing, invoice, promo) = two_inboxes().await;
+        let login = json_request(
+            request("POST", "/api/v1/session"),
+            json!({"token": billing}),
+        );
+        let (status, headers, body) = send(&app, login).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"inbox\":\"billing\""), "{body}");
+        let cookie = headers["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let with_cookie = |method: &str, path: &str| {
+            empty(request(method, path).header("cookie", cookie.clone()))
+        };
+
+        let own = format!("/api/v1/messages/{invoice}");
+        let theirs = format!("/api/v1/messages/{promo}");
+        assert_eq!(send(&app, with_cookie("GET", &own)).await.0, StatusCode::OK);
+        assert_eq!(
+            send(&app, with_cookie("GET", &theirs)).await.0,
+            StatusCode::NOT_FOUND
+        );
+
+        // The session holds no key, so revoking the key has to end it too.
+        let (_, keys) = json(
+            &app,
+            empty(with_key("GET", "/api/v1/inboxes/billing/keys", TOKEN)),
+        )
+        .await;
+        let key_id = keys["keys"][0]["id"].as_i64().unwrap();
+        let revoke = with_key(
+            "DELETE",
+            &format!("/api/v1/inboxes/billing/keys/{key_id}"),
+            TOKEN,
+        );
+        assert_eq!(send(&app, empty(revoke)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            send(&app, with_cookie("GET", &own)).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wrong_token_does_not_sign_in() {
+        let (app, _) = app(Some(TOKEN), false);
+        let login = json_request(
+            request("POST", "/api/v1/session"),
+            json!({"token": "guess"}),
+        );
+        let (status, headers, _) = send(&app, login).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(!headers.contains_key("set-cookie"));
+    }
+
+    #[tokio::test]
+    async fn an_unauthenticated_loopback_server_answers_only_to_local_names() {
+        let (app, _) = app(None, true);
+        let rebound = axum::http::Request::builder()
+            .uri("/api/v1/messages")
+            .header("host", "attacker.example:8025")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = send(&app, rebound).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("only answers to localhost"), "{body}");
+
+        // With a token, the token is the gate and any hostname may be used.
+        let (with_token, _) = super::tests::app(Some(TOKEN), true);
+        let named = axum::http::Request::builder()
+            .uri("/api/v1/messages")
+            .header("host", "mail.example.com")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&with_token, named).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cross_origin_writes_are_refused() {
+        let (app, store) = app(None, true);
+        let forged = request("DELETE", "/api/v1/messages").header("origin", "https://evil.example");
+        assert_eq!(send(&app, empty(forged)).await.0, StatusCode::FORBIDDEN);
+
+        let forged_post = request("POST", "/api/v1/messages")
+            .header("origin", "http://evil.example")
+            .header("content-type", "text/plain")
+            .body(Body::from("Subject: spam\r\n\r\nx"))
+            .unwrap();
+        assert_eq!(send(&app, forged_post).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(store.stats(None).unwrap().total, 0);
+
+        let own = request("DELETE", "/api/v1/messages").header("origin", "http://localhost:8025");
+        assert_eq!(send(&app, empty(own)).await.0, StatusCode::OK);
+        let sandboxed = request("DELETE", "/api/v1/messages").header("origin", "null");
+        assert_eq!(send(&app, empty(sandboxed)).await.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_proxy_that_rewrites_host_does_not_break_the_ui() {
+        let (app, _) = app(Some(TOKEN), false);
+        let proxied = |forwarded: &str| {
+            axum::http::Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/messages")
+                .header("host", "emailulator:8025")
+                .header("x-forwarded-host", forwarded)
+                .header("origin", "https://mail.example.com")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            send(&app, proxied("mail.example.com")).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(&app, proxied("other.example.com")).await.0,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn email_content_is_served_inert() {
+        let (app, _) = app(None, true);
+        let id = seed(&app, "/api/v1/messages", None).await;
+
+        let (status, headers, body) = send(
+            &app,
+            empty(request("GET", &format!("/api/v1/messages/{id}/html"))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let csp = headers["content-security-policy"].to_str().unwrap();
+        assert!(csp.starts_with("sandbox allow-popups"), "{csp}");
+        assert!(
+            !csp.contains("allow-scripts") && !csp.contains("allow-same-origin"),
+            "{csp}"
+        );
+        assert!(
+            csp.contains("default-src 'none'") && !csp.contains("script-src"),
+            "{csp}"
+        );
+        assert!(
+            body.contains("<script>"),
+            "the source is untouched; the policy is what disarms it"
+        );
+
+        let (status, headers, _) = send(
+            &app,
+            empty(request(
+                "GET",
+                &format!("/api/v1/messages/{id}/attachments/0"),
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            headers["content-disposition"]
+                .to_str()
+                .unwrap()
+                .starts_with("attachment;")
+        );
+        assert_eq!(headers["content-security-policy"], ATTACHMENT_CSP);
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+
+        let (_, headers, _) = send(
+            &app,
+            empty(request("GET", &format!("/api/v1/messages/{id}"))),
+        )
+        .await;
+        assert_eq!(headers["content-security-policy"], DATA_CSP);
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(headers["x-frame-options"], "DENY");
+        assert_eq!(headers["referrer-policy"], "no-referrer");
+    }
+
+    #[tokio::test]
+    async fn the_client_check_reports_on_a_message_within_reach() {
+        let (app, _store, billing, marketing, invoice, _promo) = two_inboxes().await;
+        let uri = format!("/api/v1/messages/{invoice}/check");
+
+        let (status, report) = json(&app, empty(with_key("GET", &uri, &billing))).await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        assert!(report["features_found"].as_u64().unwrap() >= 1, "{report}");
+        assert_eq!(report["clients"][0]["family"], "gmail");
+        assert!(report["data_updated"].as_str().unwrap().len() == 10);
+
+        let (_, narrowed) = json(
+            &app,
+            empty(with_key(
+                "GET",
+                &format!("{uri}?clients=outlook,%20gmail"),
+                &billing,
+            )),
+        )
+        .await;
+        assert_eq!(narrowed["clients"].as_array().unwrap().len(), 2);
+
+        // Another inbox's message is not there to be checked.
+        assert_eq!(
+            send(&app, empty(with_key("GET", &uri, &marketing))).await.0,
+            StatusCode::NOT_FOUND
+        );
+        let missing = with_key("GET", "/api/v1/messages/9999/check", TOKEN);
+        assert_eq!(send(&app, empty(missing)).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn mcp_speaks_json_rpc_over_post_within_the_callers_inbox() {
+        let (app, _store, billing, _marketing, invoice, promo) = two_inboxes().await;
+        let call = |key: &str, name: &str, arguments: Value| {
+            json_request(
+                with_key("POST", "/mcp", key),
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": name, "arguments": arguments}}),
+            )
+        };
+
+        let (status, reply) = json(&app, call(&billing, "list_messages", json!({}))).await;
+        assert_eq!(status, StatusCode::OK);
+        let listed = &reply["result"]["structuredContent"];
+        assert_eq!(listed["total"], 1);
+        assert_eq!(listed["messages"][0]["id"], invoice);
+
+        let (_, reply) = json(&app, call(&billing, "get_message", json!({"id": promo}))).await;
+        assert_eq!(
+            reply["result"]["isError"], true,
+            "another inbox's message is out of reach"
+        );
+
+        let (_, reply) = json(&app, call(TOKEN, "list_messages", json!({}))).await;
+        assert_eq!(
+            reply["result"]["structuredContent"]["total"], 2,
+            "the admin sees every inbox"
+        );
+
+        let note = json_request(
+            with_key("POST", "/mcp", &billing),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        );
+        assert_eq!(send(&app, note).await.0, StatusCode::ACCEPTED);
+        assert_eq!(
+            send(&app, empty(with_key("GET", "/mcp", &billing))).await.0,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+    }
 
     #[test]
     fn hostnames_are_read_from_authorities() {
@@ -876,431 +2098,6 @@ mod tests {
         assert!(
             value.contains("filename*=UTF-8''a%22b%0D%0AX%3A%20y%2F..%2F%C3%A9.pdf"),
             "{value}"
-        );
-    }
-
-    use axum::body::to_bytes;
-    use tower::ServiceExt;
-
-    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
-
-    fn app(token: Option<&str>, loopback: bool) -> (Router, Arc<Store>) {
-        let store = Arc::new(Store::in_memory().unwrap());
-        let config = HttpConfig {
-            auth: token.map(|t| Arc::new(Auth::new(t.to_string()).unwrap())),
-            info: ServerInfo {
-                name: "emailulator",
-                version: "test",
-                smtp_port: 1025,
-                smtp_starttls: false,
-                smtp_auth_required: false,
-                http_tls: false,
-                auth_required: token.is_some(),
-                max_message_size: 4096,
-                max_messages: 100,
-            },
-            ui: true,
-            loopback,
-        };
-        (router(store.clone(), config), store)
-    }
-
-    fn app_with_token_on_loopback() -> (Router, Arc<Store>) {
-        app(Some(TOKEN), true)
-    }
-
-    fn request(method: &str, uri: &str) -> axum::http::request::Builder {
-        axum::http::Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("host", "localhost:8025")
-    }
-
-    async fn send(
-        app: &Router,
-        request: axum::http::Request<Body>,
-    ) -> (StatusCode, HeaderMap, String) {
-        let response = app.clone().oneshot(request).await.unwrap();
-        let (parts, body) = response.into_parts();
-        let bytes = to_bytes(body, usize::MAX).await.unwrap();
-        (
-            parts.status,
-            parts.headers,
-            String::from_utf8_lossy(&bytes).into_owned(),
-        )
-    }
-
-    fn json_body(value: Value) -> Body {
-        Body::from(serde_json::to_vec(&value).unwrap())
-    }
-
-    async fn seed(app: &Router, token: Option<&str>) -> i64 {
-        let mut builder =
-            request("POST", "/api/v1/messages").header("content-type", "application/json");
-        if let Some(token) = token {
-            builder = builder.header("authorization", format!("Bearer {token}"));
-        }
-        let body = json_body(json!({
-            "from": "app@x.test", "to": "bob@x.test", "subject": "Hello",
-            "html": "<p>Hi<script>alert(1)</script></p>",
-            "attachments": [{"filename": "evil.html", "content": "PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg=="}],
-        }));
-        let (status, _, body) = send(app, builder.body(body).unwrap()).await;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
-        serde_json::from_str::<Value>(&body).unwrap()["id"]
-            .as_i64()
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn api_round_trip_without_auth() {
-        let (app, _) = app(None, true);
-        let id = seed(&app, None).await;
-
-        let (status, _, body) = send(
-            &app,
-            request("GET", "/api/v1/messages?mailbox=bob@x.test")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let page: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(page["total"], 1);
-        assert_eq!(page["messages"][0]["subject"], "Hello");
-
-        let patch = request("PATCH", &format!("/api/v1/messages/{id}"))
-            .header("content-type", "application/json")
-            .body(json_body(json!({"read": true, "starred": true})))
-            .unwrap();
-        let (status, _, body) = send(&app, patch).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("\"starred\":true"), "{body}");
-
-        let (status, _, _) = send(
-            &app,
-            request("DELETE", &format!("/api/v1/messages/{id}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-        let (status, _, _) = send(
-            &app,
-            request("GET", &format!("/api/v1/messages/{id}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn accepts_a_raw_message_with_an_envelope() {
-        let (app, store) = app(None, true);
-        let raw = "From: a@x.test\r\nTo: shown@x.test\r\nSubject: Raw\r\n\r\nbody\r\n";
-        let post = request(
-            "POST",
-            "/api/v1/messages?from=bounce@x.test&to=one@x.test,two@x.test",
-        )
-        .header("content-type", "message/rfc822")
-        .body(Body::from(raw))
-        .unwrap();
-        let (status, _, body) = send(&app, post).await;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
-        let detail = store.get(1).unwrap().unwrap();
-        assert_eq!(detail.summary.mailboxes, vec!["one@x.test", "two@x.test"]);
-        assert_eq!(detail.envelope_from.as_deref(), Some("bounce@x.test"));
-
-        let big = request("POST", "/api/v1/messages")
-            .header("content-type", "message/rfc822")
-            .body(Body::from(vec![b'x'; 5000]))
-            .unwrap();
-        assert_eq!(send(&app, big).await.0, StatusCode::PAYLOAD_TOO_LARGE);
-    }
-
-    #[tokio::test]
-    async fn a_token_gates_the_api_and_mcp_but_not_the_shell() {
-        let (app, _) = app(Some(TOKEN), false);
-
-        for path in [
-            "/api/v1/messages",
-            "/api/v1/info",
-            "/api/v1/events",
-            "/api/v1/messages/1/raw",
-        ] {
-            let (status, headers, _) =
-                send(&app, request("GET", path).body(Body::empty()).unwrap()).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
-            assert_eq!(headers["www-authenticate"], "Bearer");
-        }
-        let mcp = request("POST", "/mcp").body(Body::from("{}")).unwrap();
-        assert_eq!(send(&app, mcp).await.0, StatusCode::UNAUTHORIZED);
-
-        let wrong = request("GET", "/api/v1/messages")
-            .header("authorization", "Bearer nope")
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(send(&app, wrong).await.0, StatusCode::UNAUTHORIZED);
-
-        let right = request("GET", "/api/v1/messages")
-            .header("authorization", format!("Bearer {TOKEN}"))
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(send(&app, right).await.0, StatusCode::OK);
-
-        // The static shell and the health probe carry no mail.
-        assert_eq!(
-            send(&app, request("GET", "/").body(Body::empty()).unwrap())
-                .await
-                .0,
-            StatusCode::OK
-        );
-        assert_eq!(
-            send(
-                &app,
-                request("GET", "/healthz").body(Body::empty()).unwrap()
-            )
-            .await
-            .0,
-            StatusCode::OK
-        );
-    }
-
-    #[tokio::test]
-    async fn the_ui_signs_in_with_a_cookie_and_out_again() {
-        let (app, _) = app(Some(TOKEN), false);
-        let login = |token: &str| {
-            request("POST", "/api/v1/session")
-                .header("content-type", "application/json")
-                .body(json_body(json!({"token": token})))
-                .unwrap()
-        };
-
-        let (status, headers, _) = send(&app, login(TOKEN)).await;
-        assert_eq!(status, StatusCode::OK);
-        let set_cookie = headers["set-cookie"].to_str().unwrap().to_string();
-        assert!(
-            set_cookie.contains("HttpOnly") && set_cookie.contains("SameSite=Strict"),
-            "{set_cookie}"
-        );
-        assert!(
-            !set_cookie.contains(TOKEN),
-            "the cookie is a session id, not the token"
-        );
-        let cookie = set_cookie.split(';').next().unwrap().to_string();
-
-        let with_cookie = |method: &str, path: &str| {
-            request(method, path)
-                .header("cookie", cookie.clone())
-                .body(Body::empty())
-                .unwrap()
-        };
-        assert_eq!(
-            send(&app, with_cookie("GET", "/api/v1/messages")).await.0,
-            StatusCode::OK
-        );
-        let (_, _, status_body) = send(&app, with_cookie("GET", "/api/v1/session")).await;
-        assert!(status_body.contains("\"authenticated\":true"));
-
-        assert_eq!(
-            send(&app, with_cookie("DELETE", "/api/v1/session")).await.0,
-            StatusCode::NO_CONTENT
-        );
-        assert_eq!(
-            send(&app, with_cookie("GET", "/api/v1/messages")).await.0,
-            StatusCode::UNAUTHORIZED
-        );
-
-        let secure = request("POST", "/api/v1/session")
-            .header("content-type", "application/json")
-            .header("x-forwarded-proto", "https")
-            .body(json_body(json!({"token": TOKEN})))
-            .unwrap();
-        let (_, headers, _) = send(&app, secure).await;
-        assert!(headers["set-cookie"].to_str().unwrap().contains("; Secure"));
-        assert!(headers.contains_key("strict-transport-security"));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_wrong_token_does_not_sign_in() {
-        let (app, _) = app(Some(TOKEN), false);
-        let login = request("POST", "/api/v1/session")
-            .header("content-type", "application/json")
-            .body(json_body(json!({"token": "guess"})))
-            .unwrap();
-        let (status, headers, _) = send(&app, login).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert!(!headers.contains_key("set-cookie"));
-    }
-
-    #[tokio::test]
-    async fn an_unauthenticated_loopback_server_answers_only_to_local_names() {
-        let (app, _) = app(None, true);
-        let rebound = axum::http::Request::builder()
-            .uri("/api/v1/messages")
-            .header("host", "attacker.example:8025")
-            .body(Body::empty())
-            .unwrap();
-        let (status, _, body) = send(&app, rebound).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert!(body.contains("only answers to localhost"), "{body}");
-
-        // With a token, the token is the gate and any hostname may be used.
-        let (with_token, _) = app_with_token_on_loopback();
-        let named = axum::http::Request::builder()
-            .uri("/api/v1/messages")
-            .header("host", "mail.example.com")
-            .header("authorization", format!("Bearer {TOKEN}"))
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(send(&with_token, named).await.0, StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn cross_origin_writes_are_refused() {
-        let (app, store) = app(None, true);
-        let forged = request("DELETE", "/api/v1/messages")
-            .header("origin", "https://evil.example")
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(send(&app, forged).await.0, StatusCode::FORBIDDEN);
-
-        let forged_post = request("POST", "/api/v1/messages")
-            .header("origin", "http://evil.example")
-            .header("content-type", "text/plain")
-            .body(Body::from("Subject: spam\r\n\r\nx"))
-            .unwrap();
-        assert_eq!(send(&app, forged_post).await.0, StatusCode::FORBIDDEN);
-        assert_eq!(store.stats().unwrap().total, 0);
-
-        let own = request("DELETE", "/api/v1/messages")
-            .header("origin", "http://localhost:8025")
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(send(&app, own).await.0, StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn sandboxed_and_proxied_origins_are_told_apart() {
-        let (open, _) = app(None, true);
-        let sandboxed = request("DELETE", "/api/v1/messages")
-            .header("origin", "null")
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(send(&open, sandboxed).await.0, StatusCode::FORBIDDEN);
-
-        // A proxy that rewrites Host must not lock the UI out of its own API.
-        let (app, _) = app(Some(TOKEN), false);
-        let proxied = |forwarded: &str| {
-            axum::http::Request::builder()
-                .method("DELETE")
-                .uri("/api/v1/messages")
-                .header("host", "emailulator:8025")
-                .header("x-forwarded-host", forwarded)
-                .header("origin", "https://mail.example.com")
-                .header("authorization", format!("Bearer {TOKEN}"))
-                .body(Body::empty())
-                .unwrap()
-        };
-        assert_eq!(
-            send(&app, proxied("mail.example.com")).await.0,
-            StatusCode::OK
-        );
-        assert_eq!(
-            send(&app, proxied("other.example.com")).await.0,
-            StatusCode::FORBIDDEN
-        );
-    }
-
-    #[tokio::test]
-    async fn email_content_is_served_inert() {
-        let (app, _) = app(None, true);
-        let id = seed(&app, None).await;
-
-        let (status, headers, body) = send(
-            &app,
-            request("GET", &format!("/api/v1/messages/{id}/html"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let csp = headers["content-security-policy"].to_str().unwrap();
-        assert!(csp.starts_with("sandbox allow-popups"), "{csp}");
-        assert!(
-            !csp.contains("allow-scripts") && !csp.contains("allow-same-origin"),
-            "{csp}"
-        );
-        assert!(
-            csp.contains("default-src 'none'") && !csp.contains("script-src"),
-            "{csp}"
-        );
-        assert!(
-            body.contains("<script>"),
-            "the source is untouched; the policy is what disarms it"
-        );
-
-        let (status, headers, _) = send(
-            &app,
-            request("GET", &format!("/api/v1/messages/{id}/attachments/0"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(
-            headers["content-disposition"]
-                .to_str()
-                .unwrap()
-                .starts_with("attachment;")
-        );
-        assert_eq!(headers["content-security-policy"], ATTACHMENT_CSP);
-        assert_eq!(headers["x-content-type-options"], "nosniff");
-
-        let (_, headers, _) = send(
-            &app,
-            request("GET", &format!("/api/v1/messages/{id}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(headers["content-security-policy"], DATA_CSP);
-        assert_eq!(headers["cache-control"], "no-store");
-        assert_eq!(headers["x-frame-options"], "DENY");
-        assert_eq!(headers["referrer-policy"], "no-referrer");
-    }
-
-    #[tokio::test]
-    async fn mcp_speaks_json_rpc_over_post() {
-        let (app, _) = app(None, true);
-        seed(&app, None).await;
-        let call = request("POST", "/mcp")
-            .header("content-type", "application/json")
-            .body(json_body(
-                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                                   "params": {"name": "list_mailboxes", "arguments": {}}}),
-            ))
-            .unwrap();
-        let (status, _, body) = send(&app, call).await;
-        assert_eq!(status, StatusCode::OK);
-        let reply: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(
-            reply["result"]["structuredContent"]["mailboxes"][0]["address"],
-            "bob@x.test"
-        );
-
-        let note = request("POST", "/mcp")
-            .body(json_body(
-                json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-            ))
-            .unwrap();
-        assert_eq!(send(&app, note).await.0, StatusCode::ACCEPTED);
-        assert_eq!(
-            send(&app, request("GET", "/mcp").body(Body::empty()).unwrap())
-                .await
-                .0,
-            StatusCode::METHOD_NOT_ALLOWED
         );
     }
 }

@@ -18,8 +18,8 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::compose::valid_address;
 use crate::model::Source;
-use crate::security::{Credentials, SecretComparer};
-use crate::store::{Incoming, Store};
+use crate::security::API_KEY_PREFIX;
+use crate::store::{DEFAULT_INBOX, Incoming, Store};
 
 const MAX_COMMAND_LINE: usize = 4096;
 const MAX_BAD_COMMANDS: usize = 10;
@@ -35,8 +35,10 @@ pub struct SmtpConfig {
     pub idle_timeout: Duration,
     /// Pause after a failed AUTH, to slow password guessing.
     pub auth_failure_delay: Duration,
-    /// When set, clients must authenticate with these before sending.
-    pub credentials: Option<Credentials>,
+    /// When set, a client must authenticate as an inbox before sending: the
+    /// inbox id as username, one of its API keys as password. When clear,
+    /// mail sent without authenticating goes to the default inbox.
+    pub require_auth: bool,
     /// When set, STARTTLS is offered.
     pub tls: Option<TlsAcceptor>,
 }
@@ -50,7 +52,7 @@ impl Default for SmtpConfig {
             max_connections: 100,
             idle_timeout: Duration::from_secs(120),
             auth_failure_delay: Duration::from_secs(1),
-            credentials: None,
+            require_auth: false,
             tls: None,
         }
     }
@@ -59,16 +61,11 @@ impl Default for SmtpConfig {
 struct Context {
     store: Arc<Store>,
     config: SmtpConfig,
-    comparer: SecretComparer,
 }
 
 pub async fn serve(listener: TcpListener, store: Arc<Store>, config: SmtpConfig) -> Result<()> {
     let slots = Arc::new(Semaphore::new(config.max_connections.max(1)));
-    let context = Arc::new(Context {
-        store,
-        config,
-        comparer: SecretComparer::default(),
-    });
+    let context = Arc::new(Context { store, config });
     loop {
         let (mut stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -181,6 +178,8 @@ struct Session<'a, S> {
     peer: SocketAddr,
     secure: bool,
     authenticated: bool,
+    /// The inbox this client authenticated as, and so delivers into.
+    inbox: Option<String>,
     auth_failures: usize,
     bad_commands: usize,
     mail_from: Option<String>,
@@ -335,21 +334,36 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<'_, S> {
             return Ok(true);
         };
 
-        let accepted = match &self.context.config.credentials {
-            // Nothing configured: accept whatever the application was set up
-            // with, so a placeholder username and password just work.
-            None => true,
-            Some(expected) => {
-                let comparer = &self.context.comparer;
-                // Evaluate both so a wrong username costs the same as a wrong password.
-                let user_ok = comparer.eq(user.as_bytes(), expected.username.as_bytes());
-                let pass_ok = comparer.eq(pass.as_bytes(), expected.password.as_bytes());
-                user_ok & pass_ok
+        // The username names an inbox and the password is one of its keys.
+        let store = self.context.store.clone();
+        let key = pass.clone();
+        let owner = match tokio::task::spawn_blocking(move || store.inbox_for_key(&key)).await {
+            Ok(Ok(owner)) => owner,
+            _ => {
+                tracing::error!("looking up an API key failed");
+                self.reply("454 4.7.0 Temporary authentication failure")
+                    .await?;
+                return Ok(true);
             }
         };
+        let accepted = match owner {
+            // A key opens only the inbox it belongs to; presenting it with
+            // another inbox's id is a misconfiguration worth refusing loudly.
+            Some(inbox) if inbox == user => Some(Some(inbox)),
+            Some(_) => None,
+            // Not a key at all. Where authentication is optional, accept the
+            // placeholder credentials an application was set up with and file
+            // its mail in the default inbox. Something shaped like a key is a
+            // mistyped or revoked one, and quietly misfiling that would hide it.
+            None if !self.context.config.require_auth && !pass.starts_with(API_KEY_PREFIX) => {
+                Some(None)
+            }
+            None => None,
+        };
 
-        if accepted {
+        if let Some(inbox) = accepted {
             self.authenticated = true;
+            self.inbox = inbox;
             self.reply("235 2.7.0 Authentication successful").await?;
             return Ok(true);
         }
@@ -367,8 +381,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<'_, S> {
     }
 
     async fn mail(&mut self, rest: &str) -> std::io::Result<()> {
-        if self.context.config.credentials.is_some() && !self.authenticated {
-            return self.reply("530 5.7.0 Authentication required").await;
+        if self.context.config.require_auth && !self.authenticated {
+            return self
+                .reply("530 5.7.0 Authentication required: inbox id and API key")
+                .await;
         }
         if self.mail_from.is_some() {
             return self.reply("503 5.5.1 Sender already given").await;
@@ -462,6 +478,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<'_, S> {
 
         let incoming = Incoming {
             raw: message,
+            inbox: self
+                .inbox
+                .clone()
+                .unwrap_or_else(|| DEFAULT_INBOX.to_string()),
             envelope_from: self.mail_from.take().filter(|f| !f.is_empty()),
             envelope_to: std::mem::take(&mut self.recipients),
             source: Source::Smtp,
@@ -472,7 +492,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<'_, S> {
                 tracing::info!(
                     id = summary.id,
                     peer = %self.peer,
-                    recipients = summary.mailboxes.len(),
+                    inbox = %summary.inbox,
+                    recipients = summary.recipients.len(),
                     size = summary.size,
                     "message received over SMTP"
                 );
@@ -581,6 +602,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         peer,
         secure,
         authenticated: false,
+        inbox: None,
         auth_failures: 0,
         bad_commands: 0,
         mail_from: None,
@@ -626,7 +648,7 @@ mod tests {
 
         let detail = store.get(1).unwrap().unwrap();
         assert_eq!(detail.summary.subject, "Hi");
-        assert_eq!(detail.summary.mailboxes, vec!["b@x.test", "c@x.test"]);
+        assert_eq!(detail.summary.recipients, vec!["b@x.test", "c@x.test"]);
         assert_eq!(detail.envelope_from.as_deref(), Some("a@x.test"));
         let text = detail.text.unwrap();
         assert!(
@@ -652,7 +674,7 @@ mod tests {
             reply.contains("250 2.0.0 Ok\r\n221"),
             "NOOP still understood: {reply}"
         );
-        assert_eq!(store.stats().unwrap().total, 0);
+        assert_eq!(store.stats(None).unwrap().total, 0);
 
         let reply = converse(addr, "MAIL FROM:<a@x.test> SIZE=9999\r\nQUIT\r\n").await;
         assert!(
@@ -661,49 +683,100 @@ mod tests {
         );
     }
 
+    fn plain(user: &str, pass: &str) -> String {
+        BASE64.encode(format!("\0{user}\0{pass}"))
+    }
+
+    const BODY: &str = "MAIL FROM:<a@x.test>\r\nRCPT TO:<b@x.test>\r\nDATA\r\n\
+        Subject: ok\r\n\r\nbody\r\n.\r\nQUIT\r\n";
+
     #[tokio::test]
-    async fn requires_configured_credentials() {
+    async fn an_inbox_id_and_its_key_deliver_into_that_inbox() {
         let config = SmtpConfig {
-            credentials: Some(Credentials::parse("app:secret-pass").unwrap()),
+            require_auth: true,
+            auth_failure_delay: Duration::ZERO,
             ..SmtpConfig::default()
         };
         let (addr, store) = start(config).await;
+        store.create_inbox("billing").unwrap();
+        store.create_inbox("marketing").unwrap();
+        let (_, key) = store.create_key("billing", "app").unwrap();
 
         let reply = converse(addr, "EHLO t\r\nMAIL FROM:<a@x.test>\r\nQUIT\r\n").await;
-        assert!(reply.contains("530 5.7.0"), "{reply}");
+        assert!(
+            reply.contains("530 5.7.0"),
+            "sending needs authentication: {reply}"
+        );
 
-        let good = BASE64.encode("\0app\0secret-pass");
+        let script = format!("EHLO t\r\nAUTH PLAIN {}\r\n{BODY}", plain("billing", &key));
+        let reply = converse(addr, &script).await;
+        assert!(reply.contains("235 2.7.0"), "{reply}");
+        assert_eq!(store.stats(Some("billing")).unwrap().total, 1);
+        assert_eq!(store.stats(None).unwrap().total, 1, "and nowhere else");
+
+        // The same key under another inbox's id, or no inbox's, opens nothing.
+        for user in ["marketing", "default", "", "nobody"] {
+            let script = format!("EHLO t\r\nAUTH PLAIN {}\r\n{BODY}", plain(user, &key));
+            let reply = converse(addr, &script).await;
+            assert!(reply.contains("535 5.7.8"), "as {user:?}: {reply}");
+            assert!(reply.contains("530 5.7.0"), "as {user:?}: {reply}");
+        }
+        assert_eq!(store.stats(None).unwrap().total, 1);
+
+        // AUTH LOGIN carries the same pair.
         let script = format!(
-            "EHLO t\r\nAUTH PLAIN {good}\r\nMAIL FROM:<a@x.test>\r\nRCPT TO:<b@x.test>\r\nDATA\r\n\
-             Subject: ok\r\n\r\nbody\r\n.\r\nQUIT\r\n"
+            "AUTH LOGIN\r\n{}\r\n{}\r\n{BODY}",
+            BASE64.encode("billing"),
+            BASE64.encode(&key)
         );
         let reply = converse(addr, &script).await;
         assert!(reply.contains("235 2.7.0"), "{reply}");
-        assert_eq!(store.stats().unwrap().total, 1);
+        assert_eq!(store.stats(Some("billing")).unwrap().total, 2);
     }
 
     #[tokio::test]
     async fn drops_clients_after_repeated_bad_credentials() {
         let config = SmtpConfig {
+            require_auth: true,
             auth_failure_delay: Duration::ZERO,
-            credentials: Some(Credentials::parse("app:secret-pass").unwrap()),
             ..SmtpConfig::default()
         };
         let (addr, _store) = start(config).await;
-        let bad = BASE64.encode("\0app\0wrong");
-        let script = format!("AUTH PLAIN {bad}\r\n").repeat(5);
+        let script = format!("AUTH PLAIN {}\r\n", plain("default", "wrong")).repeat(5);
         let reply = converse(addr, &script).await;
         assert_eq!(reply.matches("535 5.7.8").count(), 2, "{reply}");
         assert!(reply.contains("421 4.7.0 Too many failed"), "{reply}");
     }
 
     #[tokio::test]
-    async fn accepts_any_login_when_no_credentials_are_configured() {
-        let (addr, _store) = start(SmtpConfig::default()).await;
-        let user = BASE64.encode("whoever");
-        let pass = BASE64.encode("whatever");
-        let reply = converse(addr, &format!("AUTH LOGIN\r\n{user}\r\n{pass}\r\nQUIT\r\n")).await;
+    async fn without_required_auth_mail_goes_to_the_default_inbox() {
+        let config = SmtpConfig {
+            auth_failure_delay: Duration::ZERO,
+            ..SmtpConfig::default()
+        };
+        let (addr, store) = start(config).await;
+        store.create_inbox("billing").unwrap();
+        let (_, key) = store.create_key("billing", "app").unwrap();
+
+        // No AUTH at all, and the placeholder credentials an app ships with.
+        converse(addr, BODY).await;
+        let script = format!("AUTH PLAIN {}\r\n{BODY}", plain("whoever", "whatever"));
+        let reply = converse(addr, &script).await;
         assert!(reply.contains("235 2.7.0"), "{reply}");
+        assert_eq!(store.stats(Some(DEFAULT_INBOX)).unwrap().total, 2);
+
+        // A real key still routes to its inbox.
+        let script = format!("AUTH PLAIN {}\r\n{BODY}", plain("billing", &key));
+        converse(addr, &script).await;
+        assert_eq!(store.stats(Some("billing")).unwrap().total, 1);
+
+        // Something shaped like a key that is not one is refused, not misfiled.
+        let script = format!(
+            "AUTH PLAIN {}\r\n{BODY}",
+            plain("billing", "emu_0000revoked")
+        );
+        let reply = converse(addr, &script).await;
+        assert!(reply.contains("535 5.7.8"), "{reply}");
     }
 
     #[tokio::test]

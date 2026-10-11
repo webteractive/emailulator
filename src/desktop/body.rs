@@ -196,6 +196,16 @@ mod pane {
             self.webview.is_some() && !self.failed && self.shown.is_some()
         }
 
+        /// The width the webview was last placed at.
+        pub fn width(&self) -> Option<f32> {
+            self.bounds.get().map(|bounds| f32::from(bounds.size.width))
+        }
+
+        /// Whether the webview is on screen, over whatever gpui has drawn.
+        pub fn is_visible(&self) -> bool {
+            self.visible
+        }
+
         /// Take the webview off screen: it is a native view above everything
         /// gpui paints, so it has to be hidden explicitly.
         pub fn hide(&mut self) {
@@ -311,6 +321,14 @@ mod pane {
 
         pub fn is_live(&self) -> bool {
             false
+        }
+
+        pub fn is_visible(&self) -> bool {
+            false
+        }
+
+        pub fn width(&self) -> Option<f32> {
+            None
         }
     }
 }

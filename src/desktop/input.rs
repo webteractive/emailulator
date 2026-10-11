@@ -31,6 +31,8 @@ actions!(
         Copy,
         Submit,
         Cancel,
+        NextField,
+        PreviousField,
     ]
 );
 
@@ -51,6 +53,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-right", End, context),
         KeyBinding::new("enter", Submit, context),
         KeyBinding::new("escape", Cancel, context),
+        KeyBinding::new("tab", NextField, context),
+        KeyBinding::new("shift-tab", PreviousField, context),
         KeyBinding::new("cmd-a", SelectAll, context),
         KeyBinding::new("cmd-v", Paste, context),
         KeyBinding::new("cmd-c", Copy, context),
@@ -66,6 +70,9 @@ pub enum InputEvent {
     Changed,
     Submitted,
     Cancelled,
+    /// Tab and Shift-Tab: the owner decides which field, if any, comes next.
+    Next,
+    Previous,
 }
 
 pub struct TextInput {
@@ -170,6 +177,14 @@ impl TextInput {
 
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(InputEvent::Cancelled);
+    }
+
+    fn next_field(&mut self, _: &NextField, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(InputEvent::Next);
+    }
+
+    fn previous_field(&mut self, _: &PreviousField, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(InputEvent::Previous);
     }
 
     fn on_mouse_down(
@@ -645,6 +660,8 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::next_field))
+            .on_action(cx.listener(Self::previous_field))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))

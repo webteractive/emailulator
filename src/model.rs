@@ -82,9 +82,13 @@ pub struct MessageSummary {
     pub read: bool,
     pub starred: bool,
     pub attachment_count: usize,
-    /// Envelope recipients: the mailboxes this message was delivered to,
-    /// including Bcc recipients that appear in no header.
-    pub mailboxes: Vec<String>,
+    /// The id of the inbox this message was delivered into.
+    pub inbox: String,
+    /// That inbox's name, for showing to people.
+    pub inbox_name: String,
+    /// Envelope recipients: everyone the message was delivered to, including
+    /// Bcc recipients that appear in no header.
+    pub recipients: Vec<String>,
     pub source: Source,
 }
 
@@ -104,12 +108,33 @@ pub struct MessageDetail {
     pub attachments: Vec<AttachmentMeta>,
 }
 
+/// A named container for one application's mail, with its own API keys.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Mailbox {
-    pub address: String,
+pub struct Inbox {
+    /// Generated when the inbox is created, and never changed: it is the
+    /// inbox's SMTP username, so applications are configured with it.
+    pub id: String,
+    /// What people call the inbox. Free text, unique, and may be changed.
+    pub name: String,
+    pub description: String,
+    pub created_at: i64,
     pub total: usize,
     pub unread: usize,
-    pub latest_at: i64,
+    pub latest_at: Option<i64>,
+    /// How many API keys the inbox has.
+    pub keys: usize,
+}
+
+/// An API key as it can be shown after creation: never the key itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKey {
+    pub id: i64,
+    pub inbox: String,
+    pub label: String,
+    /// The first characters of the key, enough to tell keys apart.
+    pub prefix: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,8 +157,10 @@ pub struct Page {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ListFilter {
+    /// Only messages in this inbox.
+    pub inbox: Option<String>,
     /// Only messages delivered to this address.
-    pub mailbox: Option<String>,
+    pub to: Option<String>,
     /// Search terms; see [`crate::store`] for the syntax.
     pub query: Option<String>,
     pub unread: Option<bool>,
@@ -155,25 +182,45 @@ pub struct Link {
     pub text: Option<String>,
 }
 
-/// A change to the store, broadcast to live viewers.
+/// A change to the store, broadcast to live viewers. Each names the inbox it
+/// happened in, so a viewer limited to one inbox can be told only about that.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    /// Boxed so the common, small events are not sized for a whole message.
     New {
-        message: MessageSummary,
+        message: Box<MessageSummary>,
     },
     Updated {
         id: i64,
+        inbox: String,
     },
     Deleted {
         id: i64,
+        inbox: String,
     },
-    /// Every message was marked read, in one mailbox or in all of them.
+    /// Several messages were marked read, in one inbox or across all of them.
     ReadAll {
-        mailbox: Option<String>,
+        inbox: Option<String>,
     },
-    /// Every message was deleted, in one mailbox or in all of them.
+    /// Several messages were deleted, in one inbox or across all of them.
     Cleared {
-        mailbox: Option<String>,
+        inbox: Option<String>,
     },
+    /// An inbox or one of its keys was created or removed.
+    Inboxes,
+}
+
+impl Event {
+    /// Whether a viewer limited to `inbox` should hear of this event.
+    pub fn concerns(&self, inbox: &str) -> bool {
+        match self {
+            Event::New { message } => message.inbox == inbox,
+            Event::Updated { inbox: i, .. } | Event::Deleted { inbox: i, .. } => i == inbox,
+            Event::ReadAll { inbox: i } | Event::Cleared { inbox: i } => {
+                i.as_deref().is_none_or(|i| i == inbox)
+            }
+            Event::Inboxes => true,
+        }
+    }
 }

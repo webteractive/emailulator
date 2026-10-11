@@ -23,6 +23,7 @@ pub struct Theme {
     pub field: Rgba,
     pub danger: Rgba,
     pub warning: Rgba,
+    pub ok: Rgba,
     pub star: Rgba,
     pub selection: Rgba,
 }
@@ -56,6 +57,7 @@ impl Theme {
             field: rgb(0xffffff),
             danger: rgb(0xc93a3a),
             warning: rgb(0x9a6200),
+            ok: rgb(0x2e7d4f),
             star: rgb(0xe0a100),
             selection: rgba(0x2f6feb40),
         }
@@ -80,6 +82,7 @@ impl Theme {
             field: rgb(0x121316),
             danger: rgb(0xf07373),
             warning: rgb(0xe0b25c),
+            ok: rgb(0x4cc38a),
             star: rgb(0xf2c230),
             selection: rgba(0x6ea1ff55),
         }

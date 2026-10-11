@@ -7,6 +7,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 COPY ui ./ui
+COPY data ./data
 
 # There is no .git in the build context; pass these to stamp `--version`:
 #   --build-arg EMAILULATOR_GIT_SHA=$(git rev-parse --short HEAD)
@@ -27,8 +28,9 @@ COPY --from=build /emailulator /usr/local/bin/emailulator
 COPY --from=build --chown=65532:65532 /data /data
 
 # A container's loopback is unreachable from outside it, so the listeners bind
-# to every interface. In return the server refuses to start until it is given
-# EMAILULATOR_AUTH_TOKEN and EMAILULATOR_SMTP_AUTH.
+# to every interface. In return the server refuses to start without
+# EMAILULATOR_AUTH_TOKEN, and SMTP clients must sign in with an inbox id and
+# one of its API keys.
 ENV EMAILULATOR_SMTP_ADDR=0.0.0.0:1025 \
     EMAILULATOR_HTTP_ADDR=0.0.0.0:8025 \
     EMAILULATOR_DATA_DIR=/data

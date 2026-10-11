@@ -29,7 +29,7 @@ impl Parsed {
     pub fn snippet(&self) -> String {
         let source = match (&self.text, &self.html) {
             (Some(text), _) => text.clone(),
-            (None, Some(html)) => mail_parser::decoders::html::html_to_text(html),
+            (None, Some(html)) => html_to_text(html),
             (None, None) => String::new(),
         };
         let mut snippet = String::new();
@@ -53,10 +53,71 @@ impl Parsed {
     pub fn search_text(&self) -> String {
         match (&self.text, &self.html) {
             (Some(text), _) => text.clone(),
-            (None, Some(html)) => mail_parser::decoders::html::html_to_text(html),
+            (None, Some(html)) => html_to_text(html),
             (None, None) => String::new(),
         }
     }
+}
+
+/// Elements that end a line of text. Their boundaries must read as a space.
+const BLOCK_TAGS: &[&str] = &[
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "br",
+    "dd",
+    "div",
+    "dl",
+    "dt",
+    "footer",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hr",
+    "li",
+    "main",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "table",
+    "td",
+    "th",
+    "tr",
+    "ul",
+];
+
+/// An HTML body as plain text, for snippets, search and agents.
+///
+/// The converter this wraps drops tags without leaving anything behind, so a
+/// heading followed by a paragraph came out as `Build passedAll tests green`.
+/// A space goes in ahead of every block-level tag first; inline tags are left
+/// alone so a word with emphasis inside it stays one word.
+pub fn html_to_text(html: &str) -> String {
+    let mut spaced = String::with_capacity(html.len() + 64);
+    let mut rest = html;
+    while let Some(at) = rest.find('<') {
+        spaced.push_str(&rest[..at]);
+        let tag = &rest[at + 1..];
+        let name: String = tag
+            .trim_start_matches('/')
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if BLOCK_TAGS.contains(&name.as_str()) {
+            spaced.push(' ');
+        }
+        spaced.push('<');
+        rest = tag;
+    }
+    spaced.push_str(rest);
+    mail_parser::decoders::html::html_to_text(&spaced)
 }
 
 fn addresses(value: Option<&mail_parser::Address<'_>>) -> Vec<Address> {
@@ -412,6 +473,28 @@ mod tests {
         assert_eq!(found[0].text.as_deref(), Some("Reset now"));
         assert_eq!(found[1].url, "https://example.com/verify/abc");
         assert_eq!(found[2].url, "https://example.com/x");
+    }
+
+    #[test]
+    fn html_blocks_read_as_separate_words() {
+        let text = html_to_text(
+            "<h2>Build passed</h2><p>All 412 tests green.<br>See <a href=x>the build</a></p>",
+        );
+        let words: Vec<&str> = text.split_whitespace().collect();
+        assert_eq!(
+            words.join(" "),
+            "Build passed All 412 tests green. See the build"
+        );
+
+        let text = html_to_text("<p>un<b>believ</b>able</p>");
+        assert_eq!(
+            text.trim(),
+            "unbelievable",
+            "inline tags do not split a word"
+        );
+
+        let html_only = parse(b"From: a@x.test\r\nSubject: s\r\nContent-Type: text/html\r\n\r\n<h1>Hi</h1><p>there</p>\r\n");
+        assert_eq!(html_only.snippet(), "Hi there");
     }
 
     #[test]

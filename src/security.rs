@@ -37,6 +37,27 @@ pub fn generate_token() -> String {
     hex(&random_bytes::<32>())
 }
 
+/// What every inbox API key starts with, so one is recognizable on sight and a
+/// mistyped or revoked key can be told from a placeholder password.
+pub const API_KEY_PREFIX: &str = "emu_";
+
+/// A fresh inbox API key: the prefix and 192 random bits as hex.
+pub fn generate_api_key() -> String {
+    format!("{API_KEY_PREFIX}{}", hex(&random_bytes::<24>()))
+}
+
+/// A fresh inbox id. Random rather than derived from the name, so renaming an
+/// inbox never changes what applications sign in with.
+pub fn generate_inbox_id() -> String {
+    format!("ibx_{}", hex(&random_bytes::<5>()))
+}
+
+/// What is stored for an API key instead of the key. The key is long and
+/// random, so a plain SHA-256 is enough: there is nothing to brute-force.
+pub fn hash_api_key(key: &str) -> String {
+    hex(ring::digest::digest(&ring::digest::SHA256, key.as_bytes()).as_ref())
+}
+
 /// Compares secrets without leaking, through timing, how much of a guess was
 /// right. Both sides are keyed-hashed first, so neither the position of the
 /// first differing byte nor the secret's length shows.
@@ -59,49 +80,41 @@ impl SecretComparer {
     }
 }
 
-#[derive(Clone)]
-pub struct Credentials {
-    pub username: String,
-    pub password: String,
+/// What a caller may reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Access {
+    /// Every inbox, and the management of inboxes and their keys.
+    Admin,
+    /// The messages of one inbox, and nothing else.
+    Inbox(String),
 }
 
-impl Credentials {
-    /// Parse `user:password`. The password may itself contain colons.
-    pub fn parse(value: &str) -> Result<Self> {
-        let (username, password) = value
-            .split_once(':')
-            .ok_or_else(|| anyhow!("SMTP credentials must be `user:password`"))?;
-        if username.is_empty() || password.is_empty() {
-            bail!("SMTP credentials must have a user and a password");
+impl Access {
+    /// The inbox this access is confined to, if it is confined.
+    pub fn inbox(&self) -> Option<&str> {
+        match self {
+            Access::Admin => None,
+            Access::Inbox(inbox) => Some(inbox),
         }
-        Ok(Self {
-            username: username.to_string(),
-            password: password.to_string(),
-        })
     }
 }
 
-// Keep secrets out of `{:?}` output, where they would end up in logs.
-impl std::fmt::Debug for Credentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Credentials")
-            .field("username", &self.username)
-            .field("password", &"<redacted>")
-            .finish()
-    }
-}
-
-/// Access control for the HTTP side: the API token, and the browser sessions
-/// opened by presenting it.
+/// Access control for the HTTP side: the admin token, and the browser sessions
+/// opened by presenting it or an inbox's API key.
 pub struct Auth {
-    token: String,
+    token: Option<String>,
     comparer: SecretComparer,
-    sessions: Mutex<HashMap<String, Instant>>,
+    sessions: Mutex<HashMap<String, (Instant, Access)>>,
 }
 
 impl Auth {
-    pub fn new(token: String) -> Result<Self> {
-        if token.len() < MIN_TOKEN_LEN {
+    /// `token` is the admin token. Without one, anyone who can reach the
+    /// server is an admin, which is only allowed on a loopback listener.
+    pub fn new(token: Option<String>) -> Result<Self> {
+        if token
+            .as_ref()
+            .is_some_and(|token| token.len() < MIN_TOKEN_LEN)
+        {
             bail!(
                 "the auth token must be at least {MIN_TOKEN_LEN} characters; \
                  `emailulator token` generates a strong one"
@@ -114,36 +127,44 @@ impl Auth {
         })
     }
 
-    pub fn token_matches(&self, candidate: &str) -> bool {
-        self.comparer
-            .eq(candidate.as_bytes(), self.token.as_bytes())
+    /// Whether callers must identify themselves at all.
+    pub fn required(&self) -> bool {
+        self.token.is_some()
     }
 
-    /// Open a browser session and return its id, the cookie value.
-    pub fn open_session(&self) -> String {
+    pub fn is_admin_token(&self, candidate: &str) -> bool {
+        self.token
+            .as_ref()
+            .is_some_and(|token| self.comparer.eq(candidate.as_bytes(), token.as_bytes()))
+    }
+
+    /// Open a browser session with the given access and return its id, the
+    /// cookie value.
+    pub fn open_session(&self, access: Access) -> String {
         let id = hex(&random_bytes::<32>());
         let now = Instant::now();
         let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-        sessions.retain(|_, expires| *expires > now);
+        sessions.retain(|_, (expires, _)| *expires > now);
         if sessions.len() >= MAX_SESSIONS {
             // Full of live sessions: drop the one closest to expiry.
             if let Some(oldest) = sessions
                 .iter()
-                .min_by_key(|(_, e)| **e)
+                .min_by_key(|(_, (e, _))| *e)
                 .map(|(k, _)| k.clone())
             {
                 sessions.remove(&oldest);
             }
         }
-        sessions.insert(id.clone(), now + SESSION_TTL);
+        sessions.insert(id.clone(), (now + SESSION_TTL, access));
         id
     }
 
-    pub fn session_valid(&self, id: &str) -> bool {
+    pub fn session(&self, id: &str) -> Option<Access> {
         let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         sessions
             .get(id)
-            .is_some_and(|expires| *expires > Instant::now())
+            .filter(|(expires, _)| *expires > Instant::now())
+            .map(|(_, access)| access.clone())
     }
 
     pub fn close_session(&self, id: &str) {
@@ -151,6 +172,14 @@ impl Auth {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(id);
+    }
+
+    /// End every session confined to `inbox`: its key was revoked or it is gone.
+    pub fn close_inbox_sessions(&self, inbox: &str) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|_, (_, access)| access.inbox() != Some(inbox));
     }
 
     pub fn session_ttl(&self) -> Duration {
@@ -205,28 +234,55 @@ mod tests {
     }
 
     #[test]
+    fn api_keys_are_distinct_and_hash_stably() {
+        let (a, b) = (generate_api_key(), generate_api_key());
+        assert!(a.starts_with(API_KEY_PREFIX) && a.len() == API_KEY_PREFIX.len() + 48);
+        assert_ne!(a, b);
+        assert_eq!(hash_api_key(&a), hash_api_key(&a));
+        assert_ne!(hash_api_key(&a), hash_api_key(&b));
+        assert!(
+            !hash_api_key(&a).contains(&a[4..]),
+            "the hash does not contain the key"
+        );
+    }
+
+    #[test]
     fn short_tokens_are_refused() {
-        assert!(Auth::new("hunter2".into()).is_err());
-        assert!(Auth::new(generate_token()).is_ok());
+        assert!(Auth::new(Some("hunter2".into())).is_err());
+        assert!(Auth::new(Some(generate_token())).is_ok());
+        assert!(Auth::new(None).is_ok());
     }
 
     #[test]
-    fn sessions_open_validate_and_close() {
-        let auth = Auth::new(generate_token()).unwrap();
-        let id = auth.open_session();
-        assert!(auth.session_valid(&id));
-        assert!(!auth.session_valid("not-a-session"));
-        auth.close_session(&id);
-        assert!(!auth.session_valid(&id));
+    fn the_admin_token_is_recognized_only_when_there_is_one() {
+        let token = generate_token();
+        let auth = Auth::new(Some(token.clone())).unwrap();
+        assert!(auth.required());
+        assert!(auth.is_admin_token(&token));
+        assert!(!auth.is_admin_token("something else"));
+
+        let open = Auth::new(None).unwrap();
+        assert!(!open.required());
+        assert!(!open.is_admin_token(""), "no token is not an empty token");
     }
 
     #[test]
-    fn credentials_parse_and_redact() {
-        let creds = Credentials::parse("app:pa:ss").unwrap();
-        assert_eq!(creds.username, "app");
-        assert_eq!(creds.password, "pa:ss");
-        assert!(!format!("{creds:?}").contains("pa:ss"));
-        assert!(Credentials::parse("nopassword").is_err());
-        assert!(Credentials::parse(":x").is_err());
+    fn sessions_carry_their_access_and_close() {
+        let auth = Auth::new(Some(generate_token())).unwrap();
+        let admin = auth.open_session(Access::Admin);
+        let scoped = auth.open_session(Access::Inbox("billing".into()));
+        assert_eq!(auth.session(&admin), Some(Access::Admin));
+        assert_eq!(auth.session(&scoped), Some(Access::Inbox("billing".into())));
+        assert_eq!(auth.session("not-a-session"), None);
+
+        auth.close_inbox_sessions("billing");
+        assert_eq!(
+            auth.session(&scoped),
+            None,
+            "revoking a key ends its sessions"
+        );
+        assert_eq!(auth.session(&admin), Some(Access::Admin));
+        auth.close_session(&admin);
+        assert_eq!(auth.session(&admin), None);
     }
 }

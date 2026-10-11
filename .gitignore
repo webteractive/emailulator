@@ -1,5 +1,7 @@
 /target
-/data
+/data/*
+!/data/caniemail.json
+!/data/caniemail.LICENSE
 *.db
 *.db-shm
 *.db-wal

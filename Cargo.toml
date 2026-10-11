@@ -10,7 +10,7 @@ publish = false
 # The gpui desktop app behind `emailulator app`. Off by default so that the
 # server builds anywhere, statically, with no windowing libraries; the macOS
 # release turns it on.
-desktop = ["dep:chrono", "dep:futures", "dep:gpui", "dep:unicode-segmentation", "dep:wry"]
+desktop = ["dep:chrono", "dep:futures", "dep:gpui", "dep:objc2", "dep:unicode-segmentation", "dep:wry"]
 # The desktop app plus gpui's headless test window, for `cargo test`.
 desktop-test = ["desktop", "gpui/test-support"]
 
@@ -46,6 +46,11 @@ unicode-segmentation = { version = "1", optional = true }
 # attach a child webview to a window it does not own on these two platforms.
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 wry = { version = "0.57", default-features = false, features = ["os-webview"], optional = true }
+
+# Sets the Dock icon. A bare binary has no app bundle to carry one, so the app
+# hands AppKit the image itself. Already in the tree, under wry.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

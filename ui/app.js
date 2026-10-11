@@ -8,7 +8,8 @@
 const PAGE = 50;
 const MAX_PAGE = 500; // the API's own ceiling
 const RAW_PREVIEW_CHARS = 500_000;
-const MANY_MAILBOXES = 8;
+const MANY_INBOXES = 8;
+const DEFAULT_INBOX = 'default';
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
 const ICONS = {
@@ -23,6 +24,9 @@ const ICONS = {
   back: ['M9.5 3.5 5 8l4.5 4.5'],
   check: ['M1.5 8.5l3 3 5.5-6.5', 'M8 11.5l6-7'],
   copy: ['M5.5 5.5h7v8h-7z', 'M3.5 10.5v-8h7'],
+  key: ['M8 10.5a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0z', 'M7.3 8.7 13 3', 'M11 5l1.6 1.6'],
+  plus: ['M8 3.5v9', 'M3.5 8h9'],
+  close: ['M4 4l8 8', 'M12 4l-8 8'],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -64,10 +68,15 @@ function icon(name, extra) {
 
 const state = {
   info: null,
-  mailboxes: [],
+  access: 'admin', // or 'inbox': a session confined to ownInbox
+  ownInbox: null,
+  inboxes: [],
+  inboxesLoaded: false,
   stats: { total: 0, unread: 0, starred: 0, bytes: 0 },
   statsLoaded: false,
-  view: { kind: 'all' }, // or {kind: 'starred'} or {kind: 'box', address}
+  view: { kind: 'all' }, // or {kind: 'starred'} or {kind: 'inbox', id}
+  panel: null, // 'connect' while an inbox's connection details are open
+  keys: null, // {inbox, list} once fetched for the open panel
   query: '',
   messages: [],
   total: 0,
@@ -80,11 +89,26 @@ const state = {
   width: 'desktop',
   raw: null, // {id, text} once fetched
   links: null, // {id, links} once fetched
-  mailboxFilter: '',
+  check: null, // {id, all, report} once fetched
+  checkAll: false, // every client in the dataset, not only the main five
+  inboxFilter: '',
 };
+
+// An API key that was just created. The server returns it once and this page
+// shows it once: it lives in this variable until the panel closes, and nowhere
+// else — not in storage, not in the address bar.
+let freshKey = null;
+// The New inbox dialog's pending credentials: the id the inbox will get and
+// the key it will be created with. Held only while the dialog is open.
+let draft = null;
+let draftTimer = null;
+let draftSeq = 0;
+// An inbox being deleted from here: its keys are not worth asking for again.
+let leavingInbox = null;
 
 let listSeq = 0;
 let detailSeq = 0;
+let keysSeq = 0;
 let events = null;
 let everConnected = false;
 let reconnectTimer = null;
@@ -194,43 +218,68 @@ function plural(count, word) {
 // Routing: the location hash is the source of truth for view, search and message
 // ---------------------------------------------------------------------------
 
+function isAdmin() {
+  return state.access === 'admin';
+}
+
+/** Where a session lands when the address names nothing it may open. */
+function homeView() {
+  return isAdmin() ? { kind: 'all' } : { kind: 'inbox', id: state.ownInbox };
+}
+
 function viewKey(view) {
-  return view.kind === 'box' ? `box:${view.address}` : view.kind;
+  return view.kind === 'inbox' ? `inbox:${view.id}` : view.kind;
 }
 
 function parseHash() {
   const raw = location.hash.replace(/^#\/?/, '');
   const [path, search = ''] = raw.split('?');
-  const [viewPart = '', idPart] = path.split('/');
-  let view = { kind: 'all' };
-  if (viewPart === 'starred') {
+  const parts = path.split('/');
+  let view = homeView();
+  let rest = parts[1];
+  if (parts[0] === 'starred') {
     view = { kind: 'starred' };
-  } else if (viewPart.startsWith('box:')) {
+  } else if (parts[0] === 'inbox') {
+    rest = undefined;
     try {
-      const address = decodeURIComponent(viewPart.slice(4));
-      if (address) view = { kind: 'box', address };
+      const id = decodeURIComponent(parts[1] || '');
+      // A session confined to one inbox has no other to open.
+      if (id && (isAdmin() || id === state.ownInbox)) {
+        view = { kind: 'inbox', id };
+        rest = parts[2];
+      }
     } catch {
-      // A mangled link falls back to all mail.
+      // A mangled link falls back to the home view.
     }
+  } else if (parts[0] !== 'all') {
+    rest = undefined;
   }
-  const id = /^\d+$/.test(idPart || '') ? Number(idPart) : null;
-  return { view, id, query: new URLSearchParams(search).get('q') || '' };
+  const panel = rest === 'connect' && view.kind === 'inbox' ? 'connect' : null;
+  const id = /^\d+$/.test(rest || '') ? Number(rest) : null;
+  return { view, id, panel, query: new URLSearchParams(search).get('q') || '' };
 }
 
-function formatHash({ view, id, query }) {
-  let hash = '#/' + (view.kind === 'box' ? `box:${encodeURIComponent(view.address)}` : view.kind);
-  if (id != null) hash += `/${id}`;
+function formatHash({ view, id, panel, query }) {
+  let hash = '#/' + (view.kind === 'inbox' ? `inbox/${encodeURIComponent(view.id)}` : view.kind);
+  if (panel) hash += `/${panel}`;
+  else if (id != null) hash += `/${id}`;
   if (query) hash += `?q=${encodeURIComponent(query)}`;
   return hash;
 }
 
-/** Move to a new route. Unspecified parts keep their current value. */
+/**
+ * Move to a new route. Unspecified parts keep their current value, except that
+ * opening a message or changing view closes an open panel.
+ */
 function setRoute(change, { replace = false } = {}) {
+  const leaving = 'view' in change || change.id != null;
   const next = {
     view: change.view ?? state.view,
     id: change.id !== undefined ? change.id : state.selectedId,
+    panel: 'panel' in change ? change.panel : leaving ? null : state.panel,
     query: change.query ?? state.query,
   };
+  if (next.panel) next.id = null;
   const hash = formatHash(next);
   if (hash !== location.hash) {
     if (replace) history.replaceState(null, '', hash);
@@ -243,8 +292,16 @@ function applyRoute(force = false) {
   const route = parseHash();
   const viewChanged =
     force || viewKey(route.view) !== viewKey(state.view) || route.query !== state.query;
+  const inboxChanged = force || viewKey(route.view) !== viewKey(state.view);
+  const panelChanged = force || route.panel !== state.panel || (route.panel != null && inboxChanged);
   state.view = route.view;
   state.query = route.query;
+  state.panel = route.panel;
+  if (!route.panel || inboxChanged) {
+    // Leaving the panel is what ends a new key's one showing.
+    freshKey = null;
+    state.keys = null;
+  }
   if ($('search').value !== state.query && document.activeElement !== $('search')) {
     $('search').value = state.query;
   }
@@ -255,8 +312,13 @@ function applyRoute(force = false) {
     renderList();
     loadList({ reset: true });
   }
-  if (force || route.id !== state.selectedId) {
+  if (force || route.id !== state.selectedId || panelChanged) {
     loadDetail(route.id);
+  }
+  if (route.panel && panelChanged) loadKeys();
+  if (panelChanged) {
+    renderListHead();
+    renderEmptiness();
   }
   closeDrawer();
 }
@@ -267,7 +329,7 @@ function applyRoute(force = false) {
 
 function listParams() {
   const params = new URLSearchParams();
-  if (state.view.kind === 'box') params.set('mailbox', state.view.address);
+  if (state.view.kind === 'inbox') params.set('inbox', state.view.id);
   if (state.view.kind === 'starred') params.set('starred', 'true');
   if (state.query) params.set('q', state.query);
   return params;
@@ -314,16 +376,38 @@ async function loadMore() {
   }
 }
 
-async function loadMailboxes() {
+async function loadInboxes() {
   try {
-    const data = await api('/api/v1/mailboxes');
-    state.mailboxes = data.mailboxes;
+    const data = await api('/api/v1/inboxes');
+    state.inboxes = data.inboxes;
     state.stats = data.stats;
     state.statsLoaded = true;
+    state.inboxesLoaded = true;
+    if (state.view.kind === 'inbox' && !data.inboxes.some((inbox) => inbox.id === state.view.id)) {
+      toast('That inbox no longer exists.');
+      setRoute({ view: homeView(), id: null, query: '', panel: null }, { replace: true });
+    }
     renderSidebar();
     renderEmptiness();
   } catch (error) {
     report(error);
+  }
+}
+
+/** The keys of the inbox whose panel is open. Only an admin may list them. */
+async function loadKeys() {
+  if (!isAdmin() || state.panel !== 'connect' || state.view.kind !== 'inbox') return;
+  const inbox = state.view.id;
+  if (inbox === leavingInbox) return;
+  const seq = ++keysSeq;
+  try {
+    const data = await api(`/api/v1/inboxes/${encodeURIComponent(inbox)}/keys`);
+    if (seq !== keysSeq || state.panel !== 'connect' || state.view.id !== inbox) return;
+    state.keys = { inbox, list: data.keys };
+    renderKeys();
+  } catch (error) {
+    // 404: the inbox went away; the inbox list notices and leaves.
+    if (seq === keysSeq && error.status !== 404) report(error);
   }
 }
 
@@ -334,7 +418,8 @@ async function loadDetail(id) {
   state.detailError = null;
   state.raw = null;
   state.links = null;
-  document.body.dataset.pane = id == null ? 'list' : 'reader';
+  state.check = null;
+  document.body.dataset.pane = id == null && !state.panel ? 'list' : 'reader';
   renderSelection();
   renderReader();
   if (id == null) return;
@@ -361,7 +446,7 @@ function scheduleRefresh() {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => {
     loadList();
-    loadMailboxes();
+    loadInboxes();
   }, 120);
 }
 
@@ -438,15 +523,32 @@ async function deleteSelected() {
   scheduleRefresh();
 }
 
+/** What people call an inbox. Its id is for machines: the SMTP username. */
+function inboxName(id) {
+  return state.inboxes.find((inbox) => inbox.id === id)?.name || id;
+}
+
 function viewName() {
-  if (state.view.kind === 'box') return state.view.address;
+  if (state.view.kind === 'inbox') return inboxName(state.view.id);
   return state.view.kind === 'starred' ? 'Starred' : 'All mail';
 }
 
+/** What the bulk actions are about to touch, in words. */
+function scopeName() {
+  const where =
+    state.view.kind === 'inbox'
+      ? `in the ${inboxName(state.view.id)} inbox`
+      : isAdmin()
+        ? 'across every inbox'
+        : `in the ${inboxName(state.ownInbox)} inbox`;
+  if (state.query) return `matching “${state.query}” ${where}`;
+  if (state.view.kind === 'starred') return `starred ${where}`;
+  return where;
+}
+
 async function markAllRead() {
-  const mailbox = state.view.kind === 'box' ? `?mailbox=${encodeURIComponent(state.view.address)}` : '';
   try {
-    await api(`/api/v1/messages${mailbox}`, { method: 'PATCH', body: { read: true } });
+    await api(`/api/v1/messages?${listParams()}`, { method: 'PATCH', body: { read: true } });
   } catch (error) {
     report(error);
   }
@@ -454,24 +556,246 @@ async function markAllRead() {
 }
 
 async function deleteAll() {
-  const inBox = state.view.kind === 'box';
+  const narrowed = state.query || state.view.kind === 'starred';
   const confirmed = await confirmAction({
-    title: inBox ? `Delete everything in ${state.view.address}?` : 'Delete all mail?',
-    body: `${plural(state.total, 'message')} will be deleted for good${
-      inBox ? ', including copies that were also delivered to other mailboxes' : ''
-    }.`,
-    action: inBox ? 'Delete mailbox contents' : 'Delete all',
+    title: narrowed
+      ? `Delete ${plural(state.total, 'listed message')}?`
+      : state.view.kind === 'inbox'
+        ? `Delete everything in ${inboxName(state.view.id)}?`
+        : isAdmin()
+          ? 'Delete all mail in every inbox?'
+          : 'Delete all mail?',
+    body: `${plural(state.total, 'message')} ${scopeName()} will be deleted for good.`,
+    action: narrowed ? 'Delete listed' : 'Delete all',
     focusAction: false,
   });
   if (!confirmed) return;
-  const mailbox = inBox ? `?mailbox=${encodeURIComponent(state.view.address)}` : '';
   try {
-    await api(`/api/v1/messages${mailbox}`, { method: 'DELETE' });
+    await api(`/api/v1/messages?${listParams()}`, { method: 'DELETE' });
     setRoute({ id: null }, { replace: true });
   } catch (error) {
     report(error);
   }
   scheduleRefresh();
+}
+
+/** A key of the shape the server mints, made here so it can be shown before the inbox exists. */
+function randomKey() {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return 'emu_' + Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function renderDraft() {
+  if (!draft) return;
+  const id = $('new-inbox-id');
+  id.textContent = draft.id || 'made from the name';
+  id.classList.toggle('credential-empty', !draft.id);
+  $('new-inbox-key').textContent = draft.key;
+  const copyId = $('new-inbox-id-actions').querySelector('button');
+  if (copyId) copyId.disabled = !draft.id;
+}
+
+/** A Copy button for a value that changes while the dialog is open. */
+function draftCopyButton(read) {
+  if (!navigator.clipboard) return null;
+  return h(
+    'button',
+    { class: 'btn btn-quiet copy', type: 'button', onclick: (event) => copyText(read(), event.currentTarget) },
+    icon('copy'),
+    h('span', { class: 'copy-label', text: 'Copy' }),
+  );
+}
+
+function openNewInbox() {
+  draft = { id: '', key: randomKey() };
+  $('new-inbox-name').value = '';
+  $('new-inbox-description').value = '';
+  $('new-inbox-error').hidden = true;
+  $('new-inbox-create').disabled = false;
+  fill($('new-inbox-id-actions'), draftCopyButton(() => draft.id));
+  fill(
+    $('new-inbox-key-actions'),
+    h(
+      'button',
+      {
+        class: 'btn btn-quiet',
+        type: 'button',
+        title: 'Make a different key',
+        onclick: () => {
+          draft.key = randomKey();
+          renderDraft();
+        },
+      },
+      'Regenerate',
+    ),
+    draftCopyButton(() => draft.key),
+  );
+  renderDraft();
+  $('new-inbox-dialog').showModal();
+  $('new-inbox-name').focus();
+}
+
+/** Close the dialog and forget the key it showed. */
+function closeNewInbox() {
+  clearTimeout(draftTimer);
+  draftSeq += 1;
+  draft = null;
+  const dialog = $('new-inbox-dialog');
+  if (dialog.open) dialog.close();
+  $('new-inbox-key').textContent = '';
+}
+
+/**
+ * Ask the server which id this name would get. Only it knows which ids are
+ * taken, and so when a name's plain slug needs a number added.
+ */
+async function suggestInboxId() {
+  clearTimeout(draftTimer);
+  if (!draft) return;
+  const seq = ++draftSeq;
+  const name = $('new-inbox-name').value.trim();
+  let id = '';
+  if (name) {
+    try {
+      id = (await api('/api/v1/inboxes', { method: 'POST', body: { name, dry_run: true } })).id;
+    } catch {
+      // Creating will say what is wrong with the name.
+    }
+  }
+  if (!draft || seq !== draftSeq) return; // a later keystroke has asked again
+  draft.id = id;
+  renderDraft();
+}
+
+async function createInbox(event) {
+  event.preventDefault();
+  if (!draft) return;
+  const field = $('new-inbox-name');
+  const error = $('new-inbox-error');
+  const fail = (message) => {
+    error.textContent = message.charAt(0).toUpperCase() + message.slice(1);
+    error.hidden = false;
+    field.focus();
+  };
+  error.hidden = true;
+  const name = field.value.trim();
+  if (!name) return fail('Give the inbox a name.');
+
+  const submit = $('new-inbox-create');
+  submit.disabled = true;
+  try {
+    // Enter can beat the debounce; what is created must be what is shown.
+    await suggestInboxId();
+    if (!draft) return;
+    const body = { name, description: $('new-inbox-description').value.trim(), key: draft.key };
+    if (draft.id) body.id = draft.id;
+    const inbox = await api('/api/v1/inboxes', { method: 'POST', body });
+    closeNewInbox();
+    await loadInboxes();
+    // A new inbox is no use until an app can deliver into it: land on Connect,
+    // where its key gets its one showing outside this dialog.
+    setRoute({ view: { kind: 'inbox', id: inbox.id }, id: null, query: '', panel: 'connect' });
+    freshKey = { inbox: inbox.id, id: null, key: inbox.key, label: 'first key' };
+    renderReader();
+  } catch (failure) {
+    if (failure.status === 401) return closeNewInbox();
+    // The server says what is wrong with the name, or that it is taken.
+    fail(failure.message);
+    field.select();
+    suggestInboxId();
+  } finally {
+    submit.disabled = false;
+  }
+}
+
+async function deleteInbox() {
+  const id = state.view.id;
+  const inbox = state.inboxes.find((candidate) => candidate.id === id);
+  const total = inbox ? inbox.total : 0;
+  const keys = inbox ? inbox.keys : 0;
+  const confirmed = await confirmAction({
+    title: `Delete the ${inboxName(id)} inbox?`,
+    body: keys
+      ? `${plural(total, 'message')} and ${plural(keys, 'API key')} will be deleted for good. Anything still using ${keys === 1 ? 'that key' : 'those keys'} will be refused.`
+      : `${plural(total, 'message')} will be deleted for good, along with the inbox itself.`,
+    action: 'Delete inbox',
+    focusAction: false,
+  });
+  if (!confirmed) return;
+  leavingInbox = id;
+  try {
+    await api(`/api/v1/inboxes/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    setRoute({ view: homeView(), id: null, query: '', panel: null }, { replace: true });
+    toast(`Deleted the ${inbox ? inbox.name : id} inbox.`);
+  } catch (error) {
+    report(error);
+  } finally {
+    leavingInbox = null;
+  }
+  scheduleRefresh();
+}
+
+async function createKey(event) {
+  event.preventDefault();
+  const inbox = state.view.id;
+  const field = $('key-label');
+  try {
+    const created = await api(`/api/v1/inboxes/${encodeURIComponent(inbox)}/keys`, {
+      method: 'POST',
+      body: { label: field.value.trim() },
+    });
+    if (state.panel !== 'connect' || state.view.id !== inbox) return;
+    freshKey = { inbox, id: created.id, key: created.key, label: created.label };
+    renderReader();
+    loadKeys();
+    loadInboxes();
+  } catch (error) {
+    report(error);
+  }
+}
+
+async function regenerateKey(key) {
+  const confirmed = await confirmAction({
+    title: `Regenerate the key “${key.label}”?`,
+    body: `${key.prefix}… will stop working at once: SMTP logins, API and MCP calls, and any browser signed in with it. The key gets a new value, shown once; whatever uses it has to be given that.`,
+    action: 'Regenerate key',
+    focusAction: false,
+  });
+  if (!confirmed) return;
+  try {
+    const renewed = await api(
+      `/api/v1/inboxes/${encodeURIComponent(key.inbox)}/keys/${key.id}/regenerate`,
+      { method: 'POST' },
+    );
+    if (state.panel !== 'connect' || state.view.id !== key.inbox) return;
+    freshKey = { inbox: key.inbox, id: renewed.id, key: renewed.key, label: renewed.label };
+    renderReader();
+  } catch (error) {
+    report(error);
+  }
+  loadKeys();
+}
+
+async function revokeKey(key) {
+  const confirmed = await confirmAction({
+    title: `Revoke the key “${key.label}”?`,
+    body: `${key.prefix}… will stop working at once: SMTP logins, API and MCP calls, and any browser signed in with it. It cannot be restored.`,
+    action: 'Revoke key',
+    focusAction: false,
+  });
+  if (!confirmed) return;
+  try {
+    await api(`/api/v1/inboxes/${encodeURIComponent(key.inbox)}/keys/${key.id}`, { method: 'DELETE' });
+  } catch (error) {
+    if (error.status !== 404) return report(error);
+  }
+  if (freshKey && freshKey.id === key.id) {
+    freshKey = null;
+    if (state.panel === 'connect') renderReader();
+  }
+  loadKeys();
+  loadInboxes();
 }
 
 /**
@@ -551,57 +875,62 @@ function navItem({ view, label, iconName, badge, count, title }) {
 }
 
 function renderSidebar() {
-  const { stats, mailboxes } = state;
+  const { stats, inboxes } = state;
+  const admin = isAdmin();
   $('nav-fixed').replaceChildren(
-    navItem({ view: { kind: 'all' }, label: 'All mail', iconName: 'inbox', badge: stats.unread, count: stats.total }),
-    navItem({ view: { kind: 'starred' }, label: 'Starred', iconName: 'star', count: stats.starred }),
+    ...[
+      // "All mail" spans inboxes, which a session confined to one cannot do.
+      admin
+        ? navItem({ view: { kind: 'all' }, label: 'All mail', iconName: 'mail', badge: stats.unread, count: stats.total })
+        : null,
+      navItem({ view: { kind: 'starred' }, label: 'Starred', iconName: 'star', count: stats.starred }),
+    ].filter(Boolean),
   );
 
-  const filterField = $('mailbox-filter');
-  filterField.hidden = mailboxes.length <= MANY_MAILBOXES;
-  if (filterField.hidden && state.mailboxFilter) {
-    state.mailboxFilter = '';
+  $('new-inbox').hidden = !admin;
+  if (!admin && draft) closeNewInbox();
+
+  const filterField = $('inbox-filter');
+  filterField.hidden = inboxes.length <= MANY_INBOXES;
+  if (filterField.hidden && state.inboxFilter) {
+    state.inboxFilter = '';
     filterField.value = '';
   }
-  const needle = state.mailboxFilter.trim().toLowerCase();
-  const shown = mailboxes.filter((box) => !needle || box.address.includes(needle));
-  // A mailbox that is open but has since emptied still needs its entry.
-  if (state.view.kind === 'box' && !mailboxes.some((box) => box.address === state.view.address)) {
-    shown.unshift({ address: state.view.address, total: 0, unread: 0 });
-  }
-  $('nav-mailboxes').replaceChildren(
-    ...shown.map((box) =>
+  const needle = state.inboxFilter.trim().toLowerCase();
+  const shown = inboxes.filter(
+    (inbox) => !needle || inbox.name.toLowerCase().includes(needle) || inbox.id.includes(needle),
+  );
+  $('nav-inboxes').replaceChildren(
+    ...shown.map((inbox) =>
       navItem({
-        view: { kind: 'box', address: box.address },
-        label: box.address,
-        title: box.address,
-        iconName: 'at',
-        badge: box.unread,
-        count: box.total,
+        view: { kind: 'inbox', id: inbox.id },
+        label: inbox.name,
+        title: [inbox.name, inbox.description, `ID ${inbox.id}`].filter(Boolean).join(' — '),
+        iconName: 'inbox',
+        badge: inbox.unread,
+        count: inbox.total,
       }),
     ),
   );
-  $('mailbox-count').textContent = mailboxes.length ? String(mailboxes.length) : '';
-  const empty = $('nav-empty');
-  empty.hidden = shown.length > 0;
-  empty.textContent = mailboxes.length
-    ? 'No mailbox matches that filter.'
-    : 'Every address that receives mail gets its own mailbox here.';
+  $('inbox-count').textContent = admin && inboxes.length ? String(inboxes.length) : '';
+  $('nav-empty').hidden = !state.inboxesLoaded || shown.length > 0;
 }
 
 function smtpEndpoint() {
   return { host: location.hostname, port: state.info ? state.info.smtp_port : 1025 };
 }
 
-function renderConnect() {
+/** The sidebar footer: where this server listens and who you are to it. */
+function renderServer() {
   const info = state.info;
   if (!info) return;
   const { host, port } = smtpEndpoint();
   const row = (term, value) => [h('dt', { text: term }), h('dd', { text: value })];
   $('connect-info').replaceChildren(
     ...row('SMTP', `${host}:${port}`),
-    ...row('Login', info.smtp_auth_required ? 'required' : 'none (any is accepted)'),
+    ...row('Login', info.smtp_auth_required ? 'inbox id + API key' : 'optional; without a key, mail goes to default'),
     ...row('STARTTLS', info.smtp_starttls ? 'offered' : 'off'),
+    ...(info.auth_required ? row('Access', isAdmin() ? 'admin' : `the ${state.ownInbox} inbox only`) : []),
   );
   $('version').textContent = `v${info.version}`;
   $('sign-out').hidden = !info.auth_required;
@@ -637,6 +966,13 @@ function messageRow(message) {
         { class: 'row-top' },
         message.read ? null : h('span', { class: 'visually-hidden', text: 'Unread. ' }),
         h('span', { class: 'row-from', text: addressLabel(message.from) }),
+        isAdmin() && state.view.kind !== 'inbox'
+          ? h('span', {
+              class: 'tag row-inbox',
+              title: `In the ${message.inbox_name || message.inbox} inbox`,
+              text: message.inbox_name || message.inbox,
+            })
+          : null,
         h('time', {
           class: 'row-time',
           datetime: new Date(message.received_at).toISOString(),
@@ -674,9 +1010,17 @@ function messageRow(message) {
   );
 }
 
-function renderList() {
+/** The parts of the list header that depend on the view rather than its messages. */
+function renderListHead() {
   $('view-title').textContent = viewName();
   $('view-title').title = viewName();
+  const connect = $('connect-open');
+  connect.hidden = state.view.kind !== 'inbox';
+  connect.setAttribute('aria-pressed', state.panel === 'connect' ? 'true' : 'false');
+}
+
+function renderList() {
+  renderListHead();
   const counts = [];
   if (state.listLoaded) {
     counts.push(state.query ? `${state.total} ${state.total === 1 ? 'match' : 'matches'}` : String(state.total));
@@ -693,8 +1037,8 @@ function renderList() {
       ? 'Nothing matches that search.'
       : state.view.kind === 'starred'
         ? 'No starred messages. Press s on a message to star it.'
-        : state.view.kind === 'box'
-          ? 'Nothing has been delivered to this address.'
+        : state.view.kind === 'inbox'
+          ? 'Nothing has been delivered to this inbox yet.'
           : 'No messages yet.';
   }
 
@@ -702,10 +1046,12 @@ function renderList() {
   $('load-more').hidden = remaining <= 0 || state.messages.length === 0;
   $('load-more').textContent = `Load more (${remaining} older)`;
 
-  // The API clears and marks read by mailbox, not by search or star.
-  const bulk = !state.query && state.view.kind !== 'starred';
-  $('mark-read').hidden = !bulk;
-  $('delete-all').hidden = !bulk;
+  // Both act on exactly what this view lists: its inbox, search and star filter.
+  const what = state.query || state.view.kind === 'starred' ? 'listed' : 'all';
+  for (const [id, label] of [['mark-read', `Mark ${what} read`], ['delete-all', `Delete ${what}`]]) {
+    $(id).title = label;
+    $(id).setAttribute('aria-label', label);
+  }
   $('mark-read').disabled = state.unread === 0;
   $('delete-all').disabled = state.total === 0;
 }
@@ -746,21 +1092,37 @@ function metaRows(detail) {
 
   // Envelope recipients. One that appears in no header was a Bcc.
   const visible = new Set([...detail.to, ...detail.cc, ...detail.bcc].map((a) => a.address.toLowerCase()));
-  const delivered = detail.mailboxes.flatMap((address, i) => [
+  const delivered = detail.recipients.flatMap((address, i) => [
     i ? ', ' : null,
     h(
       'button',
       {
         class: 'link',
         type: 'button',
-        title: `Open the ${address} mailbox`,
-        onclick: () => setRoute({ view: { kind: 'box', address }, query: '' }),
+        title: `Search for mail delivered to ${address}`,
+        onclick: () => setRoute({ query: `to:${address}`, id: null }),
       },
       address,
     ),
     visible.has(address) ? null : h('span', { class: 'tag', title: 'Delivered to, but named in no header', text: 'bcc' }),
   ]);
   if (delivered.length) add('Delivered to', delivered);
+
+  add(
+    'Inbox',
+    isAdmin() && state.view.kind !== 'inbox'
+      ? h(
+          'button',
+          {
+            class: 'link',
+            type: 'button',
+            title: `Open the ${detail.inbox_name || detail.inbox} inbox`,
+            onclick: () => setRoute({ view: { kind: 'inbox', id: detail.inbox }, query: '', id: detail.id }),
+          },
+          detail.inbox_name || detail.inbox,
+        )
+      : detail.inbox_name || detail.inbox,
+  );
 
   add(
     'Received',
@@ -864,6 +1226,11 @@ function renderReader() {
     icon('back'),
   );
 
+  if (state.panel === 'connect' && state.view.kind === 'inbox') {
+    renderConnectPanel(root);
+    return;
+  }
+
   if (state.selectedId == null) {
     root.replaceChildren(
       h(
@@ -901,6 +1268,7 @@ function renderReader() {
     ['headers', 'Headers', false],
     ['raw', 'Raw', false],
     ['links', 'Links', false],
+    ['check', 'Check', false],
   ];
   const widths = [
     ['desktop', 'Desktop', 'Full width'],
@@ -1068,56 +1436,448 @@ function renderTab(tab) {
         })
         .catch(report);
     }
+  } else if (tab === 'check') {
+    const all = state.checkAll;
+    if (state.check && state.check.id === detail.id && state.check.all === all) {
+      body.replaceChildren(renderCheck(state.check.report, all));
+    } else {
+      body.replaceChildren(note('Checking…'));
+      const id = detail.id;
+      const clients = all ? '' : `?clients=${MAIN_CLIENTS.join(',')}`;
+      api(`/api/v1/messages/${id}/check${clients}`)
+        .then((data) => {
+          if (state.detail?.id !== id) return;
+          state.check = { id, all, report: data };
+          if (effectiveTab() === 'check') renderTab('check');
+        })
+        .catch(report);
+    }
   }
+}
+
+// The clients most mail is read in; the check starts with these.
+const MAIN_CLIENTS = ['gmail', 'outlook', 'apple-mail', 'yahoo', 'samsung-email'];
+
+// A dataset note arrives with its links flattened to "label (address)". Give
+// the address back as a link, named by its host; when the label already is
+// that host, the label becomes the link.
+function noteContent(text) {
+  const parts = text.split(/ ?\((https:\/\/[^\s()]+)\)/);
+  const out = [];
+  parts.forEach((part, i) => {
+    if (i % 2 === 0) {
+      out.push(part);
+      return;
+    }
+    let host;
+    try {
+      host = new URL(part).hostname.replace(/^www\./, '');
+    } catch {
+      out.push(` (${part})`);
+      return;
+    }
+    const link = h('a', { href: part, target: '_blank', rel: 'noopener noreferrer', title: part, text: host });
+    const before = out[out.length - 1];
+    if (typeof before === 'string' && before.endsWith(host)) {
+      out[out.length - 1] = before.slice(0, -host.length);
+      out.push(link);
+    } else {
+      out.push(' (', link, ')');
+    }
+  });
+  return out.filter((part) => part !== '');
+}
+
+// Which email clients will render the message as written. Everything shown
+// comes from the message or from the compatibility dataset, and goes in as
+// text: feature titles such as "<video> element" are not markup.
+function renderCheck(data, all) {
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  const clientLine = (client) => {
+    const parts = [];
+    if (client.unsupported.length) parts.push(`not supported on ${client.unsupported.join(', ')}`);
+    if (client.partial.length) parts.push(`partly on ${client.partial.join(', ')}`);
+    return h(
+      'li',
+      null,
+      h('span', { class: 'check-client', text: client.name }),
+      h('span', { class: 'check-where', text: parts.join('; ') }),
+      client.notes.length
+        ? h('ul', { class: 'check-notes' }, client.notes.map((text) => h('li', null, noteContent(text))))
+        : null,
+    );
+  };
+  const issue = (item) =>
+    h(
+      'li',
+      { class: `check-issue check-${item.severity}` },
+      h(
+        'div',
+        { class: 'check-issue-head' },
+        // The link goes to the feature's page on caniemail.com.
+        /^https:\/\//.test(item.url)
+          ? h('a', { href: item.url, target: '_blank', rel: 'noopener noreferrer', text: item.title })
+          : h('span', { text: item.title }),
+        h('span', { class: 'check-count', text: `used ${plural(item.count, 'time')}` }),
+      ),
+      h('ul', { class: 'check-clients' }, item.clients.map(clientLine)),
+    );
+  const group = (title, severity, blurb) => {
+    const items = data.issues.filter((item) => item.severity === severity);
+    if (!items.length) return null;
+    return h(
+      'section',
+      { class: 'check-group' },
+      h('h3', { text: `${title} (${items.length})` }),
+      h('p', { class: 'check-blurb', text: blurb }),
+      h('ul', { class: 'check-issues' }, items.map(issue)),
+    );
+  };
+
+  const scores = h(
+    'ul',
+    { class: 'check-scores' },
+    data.clients.map((client) => {
+      const total = client.supported + client.partial + client.unsupported + client.unknown;
+      const status = client.unsupported ? 'bad' : client.partial ? 'warn' : 'ok';
+      const detail = [];
+      if (client.unsupported) detail.push(`${client.unsupported} unsupported`);
+      if (client.partial) detail.push(`${client.partial} partial`);
+      if (client.unknown) detail.push(`${client.unknown} unknown`);
+      return h(
+        'li',
+        { class: `check-score check-score-${status}` },
+        h('span', { class: 'check-score-name', text: client.name }),
+        h('span', { class: 'check-score-num', text: `${client.supported} of ${total}` }),
+        // Each count stays on one line; a narrow card wraps between them.
+        h(
+          'span',
+          { class: 'check-score-detail' },
+          detail.length
+            ? detail.flatMap((part, i) => [i ? ', ' : null, h('span', { text: part })])
+            : 'all supported',
+        ),
+      );
+    }),
+  );
+
+  return h(
+    'div',
+    { class: 'check' },
+    h(
+      'p',
+      { class: 'check-intro' },
+      h('span', {
+        text: data.features_found
+          ? `This message uses ${plural(data.features_found, 'HTML and CSS feature')}. Below is how many of them each client supports, from caniemail.com data of ${data.data_updated}. It reads the markup; it is not a rendering.`
+          : 'This message has no HTML to check.',
+      }),
+    ),
+    data.features_found ? scores : null,
+    h(
+      'p',
+      { class: 'check-toggle' },
+      h(
+        'button',
+        {
+          class: 'btn btn-quiet',
+          type: 'button',
+          onclick: () => {
+            state.checkAll = !all;
+            renderTab('check');
+          },
+        },
+        h('span', { text: all ? 'Show the main clients only' : 'Check against every client' }),
+      ),
+    ),
+    data.notices.length
+      ? h(
+          'section',
+          { class: 'check-group' },
+          h('h3', { text: 'Worth knowing' }),
+          h('ul', { class: 'check-notices' }, data.notices.map((notice) => h('li', { text: notice.message }))),
+        )
+      : null,
+    group('Not supported', 'unsupported', 'These do nothing at all in at least one of the main clients.'),
+    group('Partly supported', 'partial', 'These work, with the caveats noted.'),
+    data.features_found && !data.issues.length
+      ? h('p', { class: 'body-note', text: 'Every feature this message uses is supported by these clients.' })
+      : null,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Rendering: an inbox's Connect panel
+// ---------------------------------------------------------------------------
+
+function copyButton(text) {
+  if (!navigator.clipboard) return null;
+  return h(
+    'button',
+    { class: 'btn btn-quiet copy', type: 'button', onclick: (event) => copyText(text, event.currentTarget) },
+    icon('copy'),
+    h('span', { class: 'copy-label', text: 'Copy' }),
+  );
+}
+
+function codeBlock(label, code) {
+  return h(
+    'figure',
+    { class: 'code' },
+    h('figcaption', null, h('span', { text: label }), copyButton(code)),
+    h('pre', null, h('code', { text: code })),
+  );
+}
+
+/** What an application needs in order to deliver into `inbox`, as snippets. */
+function snippets(inbox, key) {
+  const info = state.info;
+  const { host, port } = smtpEndpoint();
+  const env = ['MAIL_MAILER=smtp', `MAIL_HOST=${host}`, `MAIL_PORT=${port}`, `MAIL_USERNAME=${inbox}`, `MAIL_PASSWORD=${key}`];
+  if (info.smtp_starttls) env.push('MAIL_SCHEME=smtp', 'MAIL_ENCRYPTION=tls');
+  const curl = [
+    `curl -X POST ${location.origin}/api/v1/messages \\`,
+    `  -H 'Authorization: Bearer ${key}' \\`,
+    "  -H 'Content-Type: application/json' \\",
+    `  -d '{"from": "app@example.test", "to": "you@example.test", "subject": "Hello", "text": "It works."}'`,
+  ].join('\n');
+  const mcp = [
+    `claude mcp add --transport http emailulator ${location.origin}/mcp \\`,
+    `  --header "Authorization: Bearer ${key}"`,
+  ].join('\n');
+  return { env: env.join('\n'), curl, mcp };
+}
+
+function renderKeys() {
+  const root = $('keys-list');
+  if (!root) return;
+  if (!state.keys || state.keys.inbox !== state.view.id) {
+    root.replaceChildren(h('p', { class: 'hint', text: 'Loading…' }));
+    return;
+  }
+  const keys = state.keys.list;
+  if (!keys.length) {
+    root.replaceChildren(
+      h('p', {
+        class: 'hint',
+        text:
+          state.view.id === DEFAULT_INBOX
+            ? 'No keys. Mail sent without one still lands here; a key is only needed to sign an app in as this inbox.'
+            : 'No keys yet. Until it has one, nothing can deliver into this inbox or read it by key.',
+      }),
+    );
+    return;
+  }
+  root.replaceChildren(
+    h(
+      'table',
+      { class: 'keys' },
+      h(
+        'thead',
+        null,
+        h(
+          'tr',
+          null,
+          h('th', { scope: 'col', text: 'Label' }),
+          h('th', { scope: 'col', text: 'Key' }),
+          h('th', { scope: 'col', text: 'Created' }),
+          h('th', { scope: 'col', text: 'Last used' }),
+          h('th', { scope: 'col' }, h('span', { class: 'visually-hidden', text: 'Actions' })),
+        ),
+      ),
+      h(
+        'tbody',
+        null,
+        keys.map((key) =>
+          h(
+            'tr',
+            null,
+            h('th', { scope: 'row', text: key.label }),
+            h('td', { class: 'key-prefix', text: `${key.prefix}…` }),
+            h('td', { title: fullTime(key.created_at), text: relativeTime(key.created_at) }),
+            h('td', {
+              title: key.last_used_at ? fullTime(key.last_used_at) : null,
+              text: key.last_used_at ? relativeTime(key.last_used_at) : 'never',
+            }),
+            h(
+              'td',
+              { class: 'key-actions' },
+              h('button', { class: 'btn btn-quiet', type: 'button', onclick: () => regenerateKey(key) }, 'Regenerate'),
+              h('button', { class: 'btn btn-quiet btn-quiet-danger', type: 'button', onclick: () => revokeKey(key) }, 'Revoke'),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+function renderConnectPanel(root) {
+  const id = state.view.id;
+  const info = state.info;
+  const admin = isAdmin();
+  const isDefault = id === DEFAULT_INBOX;
+  const { host, port } = smtpEndpoint();
+  const inbox = state.inboxes.find((candidate) => candidate.id === id);
+  const fresh = freshKey && freshKey.inbox === id ? freshKey : null;
+  const { env, curl, mcp } = snippets(id, fresh ? fresh.key : '<API key>');
+  const close = () => setRoute({ panel: null });
+
+  const lead = isDefault
+    ? `Mail that arrives without an inbox key lands here. ${
+        info.smtp_auth_required
+          ? 'This server requires a key over SMTP, so an app reaches this inbox the same way as any other: its id and one of its keys.'
+          : 'An app on this server can send here with no username or password at all; with this inbox’s id and a key it lands here just the same.'
+      }`
+    : 'Give the app whose mail belongs here this inbox’s ID and one of its API keys. The same key reads the inbox back over the API and MCP, and nothing else.';
+
+  const fact = (term, value, mono) => [h('dt', { text: term }), h('dd', { class: mono ? 'mono' : null, text: value })];
+
+  fill(
+    root,
+    h(
+      'header',
+      { class: 'reader-head panel-head' },
+      h('button', { class: 'icon-btn back-btn', type: 'button', 'aria-label': 'Back to messages', onclick: close }, icon('back')),
+      h('h2', { class: 'reader-subject', text: `Connect to ${inbox ? inbox.name : id}` }),
+      h(
+        'div',
+        { class: 'reader-actions' },
+        h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Close', title: 'Close (Esc)', onclick: close }, icon('close')),
+      ),
+    ),
+    h(
+      'div',
+      { class: 'panel' },
+      inbox && inbox.description ? h('p', { class: 'panel-description', text: inbox.description }) : null,
+      h('p', { class: 'panel-lead', text: lead }),
+      h(
+        'dl',
+        { class: 'facts' },
+        ...fact('SMTP host', host, true),
+        ...fact('SMTP port', String(port), true),
+        ...fact('Inbox ID', id, true),
+        ...fact('Username', 'the inbox ID'),
+        ...fact(
+          'Password',
+          fresh ? 'the new key below' : admin ? 'one of this inbox’s API keys' : 'this inbox’s API key, the one you signed in with',
+        ),
+        ...fact('Encryption', info.smtp_starttls ? 'STARTTLS' : 'none'),
+        ...fact('API', 'Authorization: Bearer <API key>', true),
+        ...fact('MCP', `${location.origin}/mcp`, true),
+      ),
+
+      admin
+        ? h(
+            'section',
+            { class: 'panel-section', 'aria-labelledby': 'keys-title' },
+            h('h3', { id: 'keys-title', text: 'API keys' }),
+            fresh
+              ? h(
+                  'div',
+                  { class: 'fresh-key', role: 'status' },
+                  h('p', { class: 'fresh-key-title' }, 'New key', fresh.label ? ` “${fresh.label}”` : ''),
+                  h(
+                    'div',
+                    { class: 'fresh-key-row' },
+                    h('code', { class: 'fresh-key-value', id: 'fresh-key-value', text: fresh.key }),
+                    copyButton(fresh.key),
+                  ),
+                  h('p', {
+                    class: 'fresh-key-note',
+                    text: 'Copy it now. Only a hash of it is kept, so it will not be shown again — not here, not anywhere.',
+                  }),
+                )
+              : null,
+            h('div', { id: 'keys-list' }),
+            h(
+              'form',
+              { class: 'key-form', onsubmit: createKey },
+              h('label', { class: 'visually-hidden', for: 'key-label', text: 'Label for the new key' }),
+              h('input', {
+                id: 'key-label',
+                class: 'field',
+                type: 'text',
+                maxlength: '80',
+                autocomplete: 'off',
+                placeholder: 'Label, e.g. staging app (optional)',
+              }),
+              h('button', { class: 'btn btn-primary', type: 'submit' }, icon('key'), 'Create key'),
+            ),
+          )
+        : h('p', {
+            class: 'hint panel-note',
+            text: 'You are signed in with one of this inbox’s API keys. Creating and revoking keys takes the admin token.',
+          }),
+
+      h(
+        'section',
+        { class: 'panel-section', 'aria-labelledby': 'snippets-title' },
+        h('h3', { id: 'snippets-title', text: 'Paste into your app' }),
+        fresh
+          ? null
+          : h('p', { class: 'hint', text: 'Replace <API key> with a key. A key is shown in full only when it is created.' }),
+        codeBlock('Laravel .env', env),
+        codeBlock('Send over HTTP', curl),
+        codeBlock('Give an agent this inbox (Claude Code)', mcp),
+      ),
+
+      admin && !isDefault
+        ? h(
+            'section',
+            { class: 'panel-section danger-zone', 'aria-labelledby': 'danger-title' },
+            h('h3', { id: 'danger-title', text: 'Delete this inbox' }),
+            h('p', { class: 'hint', text: 'Removes the inbox with every message in it and all of its keys.' }),
+            h('button', { class: 'btn btn-danger-outline', type: 'button', onclick: deleteInbox }, icon('trash'), 'Delete inbox'),
+          )
+        : null,
+    ),
+  );
+  renderKeys();
 }
 
 // ---------------------------------------------------------------------------
 // Rendering: first-run welcome
 // ---------------------------------------------------------------------------
 
-function codeBlock(label, code) {
-  return h(
-    'figure',
-    { class: 'code' },
-    h(
-      'figcaption',
-      null,
-      h('span', { text: label }),
-      navigator.clipboard
-        ? h(
-            'button',
-            { class: 'btn btn-quiet copy', type: 'button', onclick: (event) => copyText(code, event.currentTarget) },
-            icon('copy'),
-            h('span', { class: 'copy-label', text: 'Copy' }),
-          )
-        : null,
-    ),
-    h('pre', null, h('code', { text: code })),
-  );
-}
-
 function renderWelcome() {
   const info = state.info;
   const { host, port } = smtpEndpoint();
-  const env = ['MAIL_MAILER=smtp', `MAIL_HOST=${host}`, `MAIL_PORT=${port}`];
-  if (info.smtp_auth_required) env.push('MAIL_USERNAME=<smtp user>', 'MAIL_PASSWORD=<smtp password>');
-  else env.push('MAIL_USERNAME=null', 'MAIL_PASSWORD=null');
-  if (info.smtp_starttls) env.push('MAIL_SCHEME=smtp', 'MAIL_ENCRYPTION=tls');
+  // In an inbox, show how to reach that inbox; otherwise the keyless way in.
+  const inbox = state.view.kind === 'inbox' ? state.view.id : isAdmin() ? null : state.ownInbox;
+  const keyed = inbox != null && (inbox !== DEFAULT_INBOX || info.smtp_auth_required || !isAdmin());
 
-  const curl = [
-    `curl -X POST ${location.origin}/api/v1/messages \\`,
-    info.auth_required ? "  -H 'Authorization: Bearer <auth token>' \\" : null,
-    "  -H 'Content-Type: application/json' \\",
-    `  -d '{"from": "app@example.test", "to": "you@example.test", "subject": "Hello", "text": "It works."}'`,
-  ]
-    .filter(Boolean)
-    .join('\n');
+  let env;
+  let curl;
+  if (keyed) {
+    ({ env, curl } = snippets(inbox, '<API key>'));
+  } else {
+    const lines = ['MAIL_MAILER=smtp', `MAIL_HOST=${host}`, `MAIL_PORT=${port}`];
+    if (info.smtp_auth_required) lines.push('MAIL_USERNAME=<inbox id>', 'MAIL_PASSWORD=<API key>');
+    else lines.push('MAIL_USERNAME=null', 'MAIL_PASSWORD=null');
+    if (info.smtp_starttls) lines.push('MAIL_SCHEME=smtp', 'MAIL_ENCRYPTION=tls');
+    env = lines.join('\n');
+    curl = [
+      `curl -X POST ${location.origin}/api/v1/messages \\`,
+      info.auth_required ? "  -H 'Authorization: Bearer <admin token or API key>' \\" : null,
+      "  -H 'Content-Type: application/json' \\",
+      `  -d '{"from": "app@example.test", "to": "you@example.test", "subject": "Hello", "text": "It works."}'`,
+    ]
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  const login = keyed
+    ? `username ${inbox}, password one of its API keys`
+    : info.smtp_auth_required
+      ? 'an inbox id as username, one of its API keys as password'
+      : 'not needed — mail without a key lands in the default inbox';
 
   $('welcome').replaceChildren(
     h(
       'div',
       { class: 'welcome-inner' },
-      h('h2', { text: 'Waiting for the first email' }),
+      h('h2', { text: keyed ? `Waiting for mail in ${inboxName(inbox)}` : 'Waiting for the first email' }),
       h('p', {
         class: 'welcome-lead',
         text: 'Point your application at this server and whatever it sends shows up here. Nothing is ever delivered onward.',
@@ -1127,20 +1887,42 @@ function renderWelcome() {
         { class: 'welcome-facts' },
         h('dt', { text: 'SMTP host' }), h('dd', { text: host }),
         h('dt', { text: 'SMTP port' }), h('dd', { text: String(port) }),
-        h('dt', { text: 'Login' }), h('dd', { text: info.smtp_auth_required ? 'required' : 'not needed — any username and password is accepted' }),
+        h('dt', { text: 'Login' }), h('dd', { text: login }),
         h('dt', { text: 'Encryption' }), h('dd', { text: info.smtp_starttls ? 'STARTTLS' : 'none' }),
       ),
-      codeBlock('Laravel .env', env.join('\n')),
+      inbox != null
+        ? h(
+            'p',
+            { class: 'welcome-action' },
+            h(
+              'button',
+              { class: 'btn', type: 'button', onclick: () => setRoute({ view: { kind: 'inbox', id: inbox }, panel: 'connect' }) },
+              icon('key'),
+              isAdmin() ? 'Connection details and API keys' : 'Connection details',
+            ),
+          )
+        : isAdmin()
+          ? h('p', {
+              class: 'hint welcome-action',
+              text: 'To keep each app’s mail apart, create an inbox for it in the sidebar and give the app that inbox’s key.',
+            })
+          : null,
+      codeBlock('Laravel .env', env),
       codeBlock('Or send over HTTP', curl),
       h('p', { class: 'hint', text: 'This page updates by itself when mail arrives.' }),
     ),
   );
 }
 
+let welcomeFor = null;
+
 function renderEmptiness() {
-  const fresh = state.statsLoaded && state.stats.total === 0 && !state.query;
+  // The welcome stands in for an empty list, but never for an open panel.
+  const fresh = state.statsLoaded && state.stats.total === 0 && !state.query && !state.panel;
   const main = $('main');
-  if (fresh === main.classList.contains('is-fresh')) return;
+  const key = fresh ? viewKey(state.view) : null;
+  if (fresh === main.classList.contains('is-fresh') && key === welcomeFor) return;
+  welcomeFor = key;
   main.classList.toggle('is-fresh', fresh);
   $('welcome').hidden = !fresh;
   if (fresh && state.info) renderWelcome();
@@ -1157,6 +1939,14 @@ function handleEvent(event) {
         state.messages = state.messages.filter((m) => m.id !== event.id);
         setRoute({ id: null }, { replace: true });
       }
+      break;
+    case 'inboxes':
+      // A key was added or revoked, or an inbox came or went.
+      if (state.panel === 'connect') loadKeys();
+      break;
+    case 'new':
+      // Mail arriving in the open inbox was sent with one of its keys; show the use.
+      if (state.panel === 'connect' && event.message?.inbox === state.view.id) loadKeys();
       break;
     case 'cleared':
     case 'resync':
@@ -1233,6 +2023,9 @@ function showLogin() {
   closeEvents();
   clearTimeout(refreshTimer);
   settleConfirm?.(false);
+  closeNewInbox();
+  freshKey = null;
+  state.keys = null;
   $('app').hidden = true;
   $('login').hidden = false;
   $('token').value = '';
@@ -1250,7 +2043,8 @@ async function submitLogin(event) {
     $('token').value = '';
     await start();
   } catch (failure) {
-    error.textContent = failure.status === 401 ? 'That token is not right.' : failure.message;
+    error.textContent =
+      failure.status === 401 ? 'That is neither the admin token nor an inbox API key.' : failure.message;
     error.hidden = false;
     $('token').select();
   } finally {
@@ -1265,11 +2059,14 @@ async function signOut() {
     return report(error);
   }
   state.messages = [];
-  state.mailboxes = [];
+  state.inboxes = [];
+  state.inboxesLoaded = false;
   state.detail = null;
   $('messages').replaceChildren();
   $('reader').replaceChildren();
-  $('nav-mailboxes').replaceChildren();
+  $('nav-inboxes').replaceChildren();
+  // The next sign-in may be a different inbox, or none; start from its home.
+  history.replaceState(null, '', location.pathname);
   showLogin();
 }
 
@@ -1309,6 +2106,10 @@ function onKeydown(event) {
       target.value = '';
       if (state.query) setQuery('');
       target.blur();
+    } else if (event.key === 'Escape' && target.closest('dialog')) {
+      // The dialog closes itself on Escape; blurring first would eat the key.
+    } else if (event.key === 'Escape') {
+      target.blur();
     }
     return;
   }
@@ -1335,6 +2136,7 @@ function onKeydown(event) {
       break;
     case 'Escape':
       if (document.body.classList.contains('drawer-open')) closeDrawer();
+      else if (state.panel) setRoute({ panel: null });
       else if (state.query) {
         $('search').value = '';
         setQuery('');
@@ -1350,6 +2152,8 @@ function bind() {
   $('menu').append(icon('menu'));
   $('mark-read').append(icon('check'));
   $('delete-all').append(icon('trash'));
+  $('new-inbox').append(icon('plus'));
+  $('connect-open').append(icon('key'), 'Connect');
 
   $('menu').addEventListener('click', openDrawer);
   $('scrim').addEventListener('click', closeDrawer);
@@ -1373,10 +2177,21 @@ function bind() {
       if (value !== state.query) setQuery(value);
     }, 250);
   });
-  $('mailbox-filter').addEventListener('input', (event) => {
-    state.mailboxFilter = event.target.value;
+  $('inbox-filter').addEventListener('input', (event) => {
+    state.inboxFilter = event.target.value;
     renderSidebar();
   });
+  $('new-inbox').addEventListener('click', openNewInbox);
+  $('new-inbox-form').addEventListener('submit', createInbox);
+  $('new-inbox-cancel').addEventListener('click', closeNewInbox);
+  // Escape, or anything else that dismisses the dialog: forget the key too.
+  $('new-inbox-dialog').addEventListener('close', closeNewInbox);
+  $('new-inbox-name').addEventListener('input', () => {
+    $('new-inbox-error').hidden = true;
+    clearTimeout(draftTimer);
+    draftTimer = setTimeout(suggestInboxId, 150);
+  });
+  $('connect-open').addEventListener('click', () => setRoute({ panel: state.panel === 'connect' ? null : 'connect' }));
 
   document.addEventListener('keydown', onKeydown);
   window.addEventListener('hashchange', () => applyRoute());
@@ -1391,15 +2206,22 @@ async function start() {
   $('login').hidden = true;
   $('app').hidden = false;
   state.info = await api('/api/v1/info');
+  // Who this session is: the admin, or one inbox's key.
+  state.access = state.info.access === 'inbox' ? 'inbox' : 'admin';
+  state.ownInbox = state.info.inbox;
   state.stats = state.info.stats;
   state.statsLoaded = true;
-  renderConnect();
+  state.inboxes = [];
+  state.inboxesLoaded = false;
+  closeNewInbox();
+  renderServer();
   renderSidebar();
   $('main').classList.remove('is-fresh');
   $('welcome').hidden = true;
-  renderEmptiness();
+  welcomeFor = null;
   applyRoute(true);
-  loadMailboxes();
+  renderEmptiness();
+  loadInboxes();
   everConnected = false;
   connectEvents();
 }

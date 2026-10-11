@@ -14,28 +14,30 @@
   <noscript><p class="noscript">emailulator's web UI needs JavaScript. The API at <code>/api/v1</code> works without it.</p></noscript>
 
   <div id="app" class="app" hidden>
-    <aside id="sidebar" class="sidebar" aria-label="Mailboxes">
+    <aside id="sidebar" class="sidebar" aria-label="Inboxes">
       <header class="brand">
         <img src="icon.svg" alt="" width="20" height="20">
-        <span class="brand-name">emailulator</span>
+        <span class="brand-name">email<span class="brand-tail">ulator</span></span>
         <span id="version" class="brand-version"></span>
       </header>
 
       <nav class="nav" aria-label="Views">
         <ul id="nav-fixed" class="nav-list"></ul>
         <div class="nav-heading">
-          <span>Mailboxes</span>
-          <span id="mailbox-count" class="nav-heading-count"></span>
+          <span>Inboxes</span>
+          <span id="inbox-count" class="nav-heading-count"></span>
+          <button id="new-inbox" class="icon-btn nav-add" type="button" aria-label="New inbox" title="New inbox"
+                  aria-haspopup="dialog" hidden></button>
         </div>
-        <label class="visually-hidden" for="mailbox-filter">Filter mailboxes</label>
-        <input id="mailbox-filter" class="field field-small" type="search" placeholder="Filter mailboxes"
+        <label class="visually-hidden" for="inbox-filter">Filter inboxes</label>
+        <input id="inbox-filter" class="field field-small" type="search" placeholder="Filter inboxes"
                autocomplete="off" spellcheck="false" hidden>
-        <ul id="nav-mailboxes" class="nav-list"></ul>
-        <p id="nav-empty" class="nav-empty" hidden>Every address that receives mail gets its own mailbox here.</p>
+        <ul id="nav-inboxes" class="nav-list"></ul>
+        <p id="nav-empty" class="nav-empty" hidden>No inbox matches that filter.</p>
       </nav>
 
       <footer class="connect">
-        <h2 class="connect-title">Send mail here</h2>
+        <h2 class="connect-title">This server</h2>
         <dl id="connect-info" class="connect-info"></dl>
         <div class="connect-row">
           <span id="live" class="live" data-state="connecting">
@@ -51,11 +53,13 @@
     <main id="main" class="main">
       <section id="list-pane" class="list-pane" aria-label="Messages">
         <header class="list-head">
-          <button id="menu" class="icon-btn menu-btn" type="button" aria-label="Show mailboxes"></button>
+          <button id="menu" class="icon-btn menu-btn" type="button" aria-label="Show inboxes"></button>
           <div class="list-title">
             <h1 id="view-title">All mail</h1>
             <span id="view-count" class="list-count"></span>
           </div>
+          <button id="connect-open" class="btn btn-quiet connect-open" type="button" aria-pressed="false"
+                  title="How to send mail to this inbox, and its API keys" hidden></button>
           <button id="mark-read" class="icon-btn" type="button" aria-label="Mark all read" title="Mark all read"></button>
           <button id="delete-all" class="icon-btn icon-btn-danger" type="button" aria-label="Delete all" title="Delete all"></button>
         </header>
@@ -80,12 +84,12 @@
   <div id="login" class="login" hidden>
     <form id="login-form" class="login-card">
       <img src="icon.svg" alt="" width="40" height="40">
-      <h1>emailulator</h1>
-      <p class="login-hint">This server is protected. Enter its auth token to read the captured mail.</p>
+      <h1>email<span class="brand-tail">ulator</span></h1>
+      <p class="login-hint">This server is protected. Sign in with its admin token, or with an inbox's API key to see that inbox alone.</p>
       <!-- Gives password managers an account name to file the token under. -->
       <input class="visually-hidden" type="text" name="username" autocomplete="username" value="emailulator"
              tabindex="-1" aria-hidden="true" readonly>
-      <label for="token">Auth token</label>
+      <label for="token">Admin token or inbox API key</label>
       <input id="token" class="field" type="password" autocomplete="current-password" required>
       <p id="login-error" class="form-error" role="alert" hidden></p>
       <button id="login-submit" class="btn btn-primary" type="submit">Sign in</button>
@@ -99,6 +103,40 @@
       <button id="confirm-cancel" class="btn" type="button">Cancel</button>
       <button id="confirm-ok" class="btn btn-danger" type="button">Delete</button>
     </div>
+  </dialog>
+
+  <dialog id="new-inbox-dialog" class="dialog dialog-form" aria-labelledby="new-inbox-title">
+    <form id="new-inbox-form" novalidate>
+      <h2 id="new-inbox-title">New inbox</h2>
+      <p class="dialog-lead">One inbox per app. The app signs in with the inbox's ID and key.</p>
+
+      <label class="form-label" for="new-inbox-name">Name</label>
+      <input id="new-inbox-name" class="field" type="text" maxlength="80" autocomplete="off" spellcheck="false"
+             placeholder="Billing app">
+
+      <label class="form-label" for="new-inbox-description">Description <span class="form-aside">optional</span></label>
+      <input id="new-inbox-description" class="field" type="text" maxlength="300" autocomplete="off"
+             placeholder="What sends mail here">
+
+      <div class="form-label-row">
+        <span id="new-inbox-id-label" class="form-label">Inbox ID <span class="form-aside">the SMTP username</span></span>
+        <span id="new-inbox-id-actions" class="form-actions"></span>
+      </div>
+      <output id="new-inbox-id" class="credential" for="new-inbox-name" aria-labelledby="new-inbox-id-label"></output>
+
+      <div class="form-label-row">
+        <span id="new-inbox-key-label" class="form-label">API key <span class="form-aside">the SMTP password, and the API token</span></span>
+        <span id="new-inbox-key-actions" class="form-actions"></span>
+      </div>
+      <output id="new-inbox-key" class="credential" aria-labelledby="new-inbox-key-label"></output>
+      <p class="hint credential-note">Copy the key now: later only its first characters can be shown.</p>
+
+      <p id="new-inbox-error" class="form-error dialog-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button id="new-inbox-cancel" class="btn" type="button">Cancel</button>
+        <button id="new-inbox-create" class="btn btn-primary" type="submit">Create inbox</button>
+      </div>
+    </form>
   </dialog>
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>

@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use emailulator::mcp::{self, Mcp};
-use emailulator::security::{self, Credentials, TlsFiles};
+use emailulator::security::{self, Access, TlsFiles};
 use emailulator::store::Limits;
 use emailulator::{Config, Emailulator, default_data_dir, open_store};
 
@@ -49,14 +49,97 @@ enum Command {
             has no app; use the web UI from `emailulator run` there."
     )]
     App(AppArgs),
+    /// Create, list and delete inboxes in the message store on this machine
+    #[command(subcommand)]
+    Inbox(InboxCommand),
+    /// Create, list and revoke the API keys of an inbox
+    #[command(subcommand)]
+    Key(KeyCommand),
     /// Serve MCP over stdio, reading the message store on this machine
-    Mcp(StoreArgs),
+    Mcp(McpArgs),
     /// Print a new random auth token
     Token,
     /// Exit 0 if a running server answers on both ports (for container health checks)
     Healthcheck(HealthArgs),
     /// Print the version
     Version,
+}
+
+#[derive(Subcommand)]
+enum InboxCommand {
+    /// List inboxes with their message and key counts
+    List(ListArgs),
+    /// Create an inbox and print its generated id and first API key
+    Create {
+        /// What to call the inbox, such as "Billing app"
+        name: String,
+        /// What the inbox is for
+        #[arg(long, default_value = "")]
+        description: String,
+        #[command(flatten)]
+        output: ListArgs,
+    },
+    /// Delete an inbox with all its messages and keys
+    Delete {
+        /// The inbox's id or name
+        inbox: String,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyCommand {
+    /// List an inbox's keys, or every key. Keys themselves are never shown again
+    List {
+        /// Only this inbox's keys, by its id or name
+        inbox: Option<String>,
+        #[command(flatten)]
+        output: ListArgs,
+    },
+    /// Create an API key for an inbox and print it, once
+    Create {
+        /// The inbox's id or name
+        inbox: String,
+        /// What the key is for, to tell keys apart later
+        #[arg(long, default_value = "")]
+        label: String,
+        #[command(flatten)]
+        output: ListArgs,
+    },
+    /// Replace a key's value, keeping its id and label, and print the new one, once.
+    /// The old value stops working at once
+    Regenerate {
+        /// The key's id, as `key list` shows
+        id: i64,
+        #[command(flatten)]
+        output: ListArgs,
+    },
+    /// Revoke a key by the id `key list` shows
+    Revoke {
+        id: i64,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+}
+
+#[derive(Args, Clone)]
+struct ListArgs {
+    #[command(flatten)]
+    store: StoreArgs,
+    /// Print JSON, for scripts and agents
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Clone)]
+struct McpArgs {
+    #[command(flatten)]
+    store: StoreArgs,
+    /// Confine the session to this inbox, by id or name, as its API key would;
+    /// all inboxes otherwise
+    #[arg(long, env = "EMAILULATOR_INBOX", value_name = "INBOX")]
+    inbox: Option<String>,
 }
 
 #[derive(Args, Clone)]
@@ -151,29 +234,24 @@ struct RunArgs {
     )]
     auth_token_file: Option<PathBuf>,
 
-    /// Credentials SMTP clients must present, as user:password
+    /// Inbox keys to make valid at startup, as inbox=key pairs separated by commas;
+    /// each inbox is created if missing. For handing an application its key through
+    /// a deployment's configuration. Mint keys by hand with `emailulator key create`
     #[arg(
         long,
-        env = "EMAILULATOR_SMTP_AUTH",
+        env = "EMAILULATOR_PROVISION",
         hide_env_values = true,
-        value_name = "USER:PASS"
+        value_delimiter = ',',
+        value_parser = parse_provision,
+        value_name = "INBOX=KEY"
     )]
-    smtp_auth: Option<String>,
-
-    /// Read the SMTP credentials from a file, such as a mounted secret
-    #[arg(
-        long,
-        env = "EMAILULATOR_SMTP_AUTH_FILE",
-        value_name = "FILE",
-        conflicts_with = "smtp_auth"
-    )]
-    smtp_auth_file: Option<PathBuf>,
+    provision: Vec<(String, String)>,
 
     /// Serve HTTP on a non-loopback address with no auth token
     #[arg(long, env = "EMAILULATOR_ALLOW_ANONYMOUS_HTTP")]
     allow_anonymous_http: bool,
 
-    /// Accept SMTP from anyone on a non-loopback address
+    /// On a non-loopback address, accept SMTP from clients with no inbox key
     #[arg(long, env = "EMAILULATOR_ALLOW_ANONYMOUS_SMTP")]
     allow_anonymous_smtp: bool,
 
@@ -224,6 +302,15 @@ struct RunArgs {
         value_name = "LEVEL"
     )]
     log_level: tracing::Level,
+}
+
+fn parse_provision(value: &str) -> Result<(String, String), String> {
+    match value.trim().split_once('=') {
+        Some((inbox, key)) if !inbox.trim().is_empty() && !key.trim().is_empty() => {
+            Ok((inbox.trim().to_string(), key.trim().to_string()))
+        }
+        _ => Err(format!("`{value}` is not an inbox=key pair")),
+    }
 }
 
 /// Parse a byte count with an optional KB, MB or GB suffix.
@@ -292,9 +379,7 @@ impl RunArgs {
             max_message_size: usize::try_from(self.max_message_size)
                 .map_err(|_| anyhow!("--max-message-size is too large for this platform"))?,
             auth_token: secret(self.auth_token, self.auth_token_file, "auth token")?,
-            smtp_credentials: secret(self.smtp_auth, self.smtp_auth_file, "SMTP credentials")?
-                .map(|value| Credentials::parse(&value))
-                .transpose()?,
+            provision: self.provision,
             allow_anonymous_http: self.allow_anonymous_http,
             allow_anonymous_smtp: self.allow_anonymous_smtp,
             tls: self
@@ -358,12 +443,20 @@ async fn serve(args: RunArgs) -> Result<()> {
     println!(
         "  SMTP   {}  ({}, {})",
         server.smtp_addr(),
-        describe(info.smtp_auth_required, "auth required", "no auth"),
+        describe(
+            info.smtp_auth_required,
+            "inbox id and API key required",
+            "no auth; unauthenticated mail goes to the default inbox"
+        ),
         describe(info.smtp_starttls, "STARTTLS", "no TLS"),
     );
     println!(
         "  HTTP   {scheme}://{http}  ({})",
-        describe(info.auth_required, "token required", "no auth"),
+        describe(
+            info.auth_required,
+            "admin token or inbox API key required",
+            "no auth"
+        ),
     );
     if ui {
         println!("         web UI   {scheme}://{http}/");
@@ -401,11 +494,180 @@ async fn serve(args: RunArgs) -> Result<()> {
     }
 }
 
-async fn mcp_stdio(args: StoreArgs) -> Result<()> {
+fn local_store(args: &StoreArgs) -> Result<emailulator::store::Store> {
+    let dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
+    open_store(Some(&dir), Limits::default())
+}
+
+async fn mcp_stdio(args: McpArgs) -> Result<()> {
     init_logging(tracing::Level::WARN);
-    let dir = args.data_dir.unwrap_or_else(default_data_dir);
-    let store = open_store(Some(&dir), Limits::default())?;
-    mcp::serve_stdio(Mcp::new(std::sync::Arc::new(store), 25 * 1024 * 1024)).await
+    let store = local_store(&args.store)?;
+    let access = match args.inbox {
+        Some(inbox) => Access::Inbox(find_inbox(&store, &inbox)?),
+        None => Access::Admin,
+    };
+    mcp::serve_stdio(
+        Mcp::new(std::sync::Arc::new(store), 25 * 1024 * 1024),
+        access,
+    )
+    .await
+}
+
+fn print_json(value: &impl serde::Serialize) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+/// What an application needs to deliver into an inbox, shown with a new key.
+fn print_key(inbox: &str, key: &str) {
+    println!("API key, shown this once:\n\n  {key}\n");
+    println!("SMTP   username  {inbox}");
+    println!("       password  the key");
+    println!("API    Authorization: Bearer <the key>");
+}
+
+/// The id of the inbox a person named by id or by name.
+fn find_inbox(store: &emailulator::store::Store, text: &str) -> Result<String> {
+    store.resolve_inbox(text)?.ok_or_else(|| {
+        anyhow!("there is no inbox with the id or name `{text}`; see `emailulator inbox list`")
+    })
+}
+
+fn inbox_command(command: InboxCommand) -> Result<()> {
+    match command {
+        InboxCommand::List(output) => {
+            let inboxes = local_store(&output.store)?.inboxes()?;
+            if output.json {
+                return print_json(&inboxes);
+            }
+            let ids = inboxes.iter().map(|i| i.id.len()).max().unwrap_or(2).max(2);
+            let names = inboxes
+                .iter()
+                .map(|i| i.name.chars().count())
+                .max()
+                .unwrap_or(4)
+                .max(4);
+            println!(
+                "{:<ids$}  {:<names$}  {:>8}  {:>6}  {:>4}",
+                "ID", "NAME", "MESSAGES", "UNREAD", "KEYS"
+            );
+            for inbox in &inboxes {
+                println!(
+                    "{:<ids$}  {:<names$}  {:>8}  {:>6}  {:>4}",
+                    inbox.id, inbox.name, inbox.total, inbox.unread, inbox.keys
+                );
+            }
+            println!(
+                "\nCreate one with `emailulator inbox create <name>`. For scripts: add --json."
+            );
+            Ok(())
+        }
+        InboxCommand::Create {
+            name,
+            description,
+            output,
+        } => {
+            let (inbox, key) =
+                local_store(&output.store)?.create_inbox_named(emailulator::store::NewInbox {
+                    name,
+                    description,
+                    ..Default::default()
+                })?;
+            if output.json {
+                let mut value = serde_json::to_value(&inbox)?;
+                value["key"] = serde_json::json!(key);
+                return print_json(&value);
+            }
+            println!(
+                "Created inbox \"{}\" with the id {}.\n",
+                inbox.name, inbox.id
+            );
+            print_key(&inbox.id, &key);
+            Ok(())
+        }
+        InboxCommand::Delete { inbox, store } => {
+            let store = local_store(&store)?;
+            let id = find_inbox(&store, &inbox)?;
+            store.delete_inbox(&id)?;
+            println!("Deleted inbox {id} with its messages and keys.");
+            Ok(())
+        }
+    }
+}
+
+fn key_command(command: KeyCommand) -> Result<()> {
+    match command {
+        KeyCommand::List { inbox, output } => {
+            let store = local_store(&output.store)?;
+            let inbox = inbox.map(|text| find_inbox(&store, &text)).transpose()?;
+            let keys = store.keys(inbox.as_deref())?;
+            if output.json {
+                return print_json(&keys);
+            }
+            if keys.is_empty() {
+                println!("No keys yet. Create one with `emailulator key create <inbox>`.");
+                return Ok(());
+            }
+            let width = keys.iter().map(|k| k.inbox.len()).max().unwrap_or(5).max(5);
+            println!(
+                "{:>4}  {:<width$}  {:<12}  {:<9}  LABEL",
+                "ID", "INBOX", "KEY", "LAST USED"
+            );
+            for key in &keys {
+                let used = if key.last_used_at.is_some() {
+                    "yes"
+                } else {
+                    "never"
+                };
+                println!(
+                    "{:>4}  {:<width$}  {:<12}  {:<9}  {}",
+                    key.id,
+                    key.inbox,
+                    format!("{}…", key.prefix),
+                    used,
+                    key.label
+                );
+            }
+            println!("\nRevoke one with `emailulator key revoke <id>`. For scripts: add --json.");
+            Ok(())
+        }
+        KeyCommand::Create {
+            inbox,
+            label,
+            output,
+        } => {
+            let store = local_store(&output.store)?;
+            let inbox = find_inbox(&store, &inbox)?;
+            let (record, key) = store.create_key(&inbox, &label)?;
+            if output.json {
+                let mut value = serde_json::to_value(&record)?;
+                value["key"] = serde_json::json!(key);
+                return print_json(&value);
+            }
+            print_key(&inbox, &key);
+            Ok(())
+        }
+        KeyCommand::Regenerate { id, output } => {
+            let Some((record, key)) = local_store(&output.store)?.regenerate_key(id, None)? else {
+                bail!("there is no key with id {id}; see `emailulator key list`");
+            };
+            if output.json {
+                let mut value = serde_json::to_value(&record)?;
+                value["key"] = serde_json::json!(key);
+                return print_json(&value);
+            }
+            println!("Key {id} regenerated. Its old value is now refused.\n");
+            print_key(&record.inbox, &key);
+            Ok(())
+        }
+        KeyCommand::Revoke { id, store } => {
+            if !local_store(&store)?.revoke_key(id, None)? {
+                bail!("there is no key with id {id}; see `emailulator key list`");
+            }
+            println!("Revoked key {id}. Anything still using it is now refused.");
+            Ok(())
+        }
+    }
 }
 
 /// Open the desktop app, which is compiled into this binary when it is built
@@ -503,6 +765,8 @@ async fn run(command: Command) -> Result<()> {
     match command {
         Command::Run(args) => serve(*args).await,
         Command::App(args) => open_app(args),
+        Command::Inbox(command) => inbox_command(command),
+        Command::Key(command) => key_command(command),
         Command::Mcp(args) => mcp_stdio(args).await,
         Command::Token => {
             println!("{}", security::generate_token());

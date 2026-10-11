@@ -4,6 +4,7 @@
 //! goes out through the web UI, the REST API and an MCP server. The binary is a
 //! thin shell over this library, and the desktop app embeds it the same way.
 
+pub mod check;
 pub mod compose;
 pub mod http;
 pub mod mcp;
@@ -22,7 +23,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use crate::http::{HttpConfig, ServerInfo};
-use crate::security::{Auth, Credentials, TlsFiles};
+use crate::security::{Auth, TlsFiles};
 use crate::smtp::SmtpConfig;
 use crate::store::{Limits, Store};
 
@@ -49,15 +50,18 @@ pub struct Config {
     pub data_dir: Option<PathBuf>,
     pub limits: Limits,
     pub max_message_size: usize,
-    /// Required by the API, MCP endpoint and web UI when set.
+    /// The admin token: every inbox, and the management of inboxes and keys.
+    /// When set, the API, MCP endpoint and web UI need it or an inbox API key.
     pub auth_token: Option<String>,
-    /// Required of SMTP clients when set.
-    pub smtp_credentials: Option<Credentials>,
+    /// Inbox ids and keys to make valid at startup, creating the inboxes as
+    /// needed. Lets a deployment hand an application its key through
+    /// configuration instead of minting one by hand.
+    pub provision: Vec<(String, String)>,
     /// Permit an HTTP listener that is reachable from other machines and has
     /// no auth token.
     pub allow_anonymous_http: bool,
-    /// Permit an SMTP listener that is reachable from other machines and
-    /// accepts mail from anyone.
+    /// Let an SMTP listener that is reachable from other machines accept mail
+    /// from clients that do not authenticate with an inbox key.
     pub allow_anonymous_smtp: bool,
     /// Enables HTTPS and SMTP STARTTLS.
     pub tls: Option<TlsFiles>,
@@ -73,7 +77,7 @@ impl Default for Config {
             limits: Limits::default(),
             max_message_size: 25 * 1024 * 1024,
             auth_token: None,
-            smtp_credentials: None,
+            provision: Vec::new(),
             allow_anonymous_http: false,
             allow_anonymous_smtp: false,
             tls: None,
@@ -83,12 +87,20 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Refuse configurations that would expose captured mail, or an open mail
-    /// sink, to a network. Returns warnings for the ones that are merely risky.
+    /// Whether SMTP clients must authenticate with an inbox id and API key.
+    /// On a loopback listener they need not, and their mail goes to the
+    /// default inbox; anywhere else they must, unless the operator says
+    /// outright that the network is trusted.
+    pub fn smtp_requires_auth(&self) -> bool {
+        !self.smtp_addr.ip().is_loopback() && !self.allow_anonymous_smtp
+    }
+
+    /// Refuse a configuration that would expose captured mail to a network,
+    /// and return warnings for the ones that are merely risky.
     ///
-    /// A listener on a loopback address is reachable only from this machine and
-    /// needs nothing. Any other address needs credentials, unless the operator
-    /// says outright that the network is trusted.
+    /// A listener on a loopback address is reachable only from this machine
+    /// and needs nothing. On any other address HTTP needs the admin token,
+    /// unless the operator says outright that the network is trusted.
     pub fn check(&self) -> Result<Vec<String>> {
         let mut warnings = Vec::new();
         let http_exposed = !self.http_addr.ip().is_loopback();
@@ -109,17 +121,9 @@ impl Config {
                 self.http_addr
             ));
         }
-        if smtp_exposed && self.smtp_credentials.is_none() {
-            if !self.allow_anonymous_smtp {
-                bail!(
-                    "the SMTP listener on {} is reachable from other machines but accepts mail \
-                     from anyone.\nSet EMAILULATOR_SMTP_AUTH=user:password, or pass \
-                     --allow-anonymous-smtp if this network is trusted.",
-                    self.smtp_addr
-                );
-            }
+        if smtp_exposed && self.allow_anonymous_smtp {
             warnings.push(format!(
-                "SMTP on {} accepts mail from anyone who can reach it",
+                "SMTP on {} accepts mail from anyone who can reach it, into the default inbox",
                 self.smtp_addr
             ));
         }
@@ -127,13 +131,13 @@ impl Config {
             if http_exposed && self.auth_token.is_some() {
                 warnings.push(
                     "HTTP is served without TLS: put it behind a TLS-terminating proxy or pass \
-                     --tls-cert and --tls-key, or the auth token crosses the network in the clear"
+                     --tls-cert and --tls-key, or tokens and keys cross the network in the clear"
                         .into(),
                 );
             }
-            if smtp_exposed && self.smtp_credentials.is_some() {
+            if smtp_exposed {
                 warnings.push(
-                    "SMTP has no STARTTLS: credentials and mail cross the network in the clear \
+                    "SMTP has no STARTTLS: inbox keys and mail cross the network in the clear \
                      unless --tls-cert and --tls-key are set"
                         .into(),
                 );
@@ -141,6 +145,26 @@ impl Config {
         }
         Ok(warnings)
     }
+}
+
+/// Whether something already answers on `addr`. A plain bind does not find
+/// out: where one program holds a port on every address, another may still
+/// bind it on a specific one, and would then take the first one's loopback
+/// traffic without either noticing.
+async fn port_answers(addr: SocketAddr) -> bool {
+    if addr.port() == 0 {
+        return false;
+    }
+    let target = if addr.ip().is_unspecified() {
+        SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), addr.port())
+    } else {
+        addr
+    };
+    let attempt = tokio::net::TcpStream::connect(target);
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), attempt).await,
+        Ok(Ok(_))
+    )
 }
 
 /// A configured server with both listeners bound, ready to serve.
@@ -159,12 +183,8 @@ impl Emailulator {
     /// Must be called inside a Tokio runtime.
     pub async fn bind(config: Config) -> Result<Self> {
         let warnings = config.check()?;
-        let auth = config
-            .auth_token
-            .clone()
-            .map(Auth::new)
-            .transpose()?
-            .map(Arc::new);
+        let auth = Arc::new(Auth::new(config.auth_token.clone())?);
+        let smtp_auth_required = config.smtp_requires_auth();
 
         let (smtp_tls, http_tls) = match &config.tls {
             Some(files) => (
@@ -175,6 +195,21 @@ impl Emailulator {
         };
 
         let store = Arc::new(open_store(config.data_dir.as_deref(), config.limits)?);
+        for (inbox, key) in &config.provision {
+            store
+                .provision_key(inbox, key)
+                .with_context(|| format!("provisioning a key for the `{inbox}` inbox"))?;
+        }
+
+        for (what, addr) in [("SMTP", config.smtp_addr), ("HTTP", config.http_addr)] {
+            if port_answers(addr).await {
+                bail!(
+                    "something is already listening on port {} ({what}); is another mail catcher \
+                     running? Stop it, or choose a different address for this one",
+                    addr.port()
+                );
+            }
+        }
 
         let smtp = TcpListener::bind(config.smtp_addr)
             .await
@@ -188,9 +223,9 @@ impl Emailulator {
             version: env!("CARGO_PKG_VERSION"),
             smtp_port: smtp.local_addr()?.port(),
             smtp_starttls: smtp_tls.is_some(),
-            smtp_auth_required: config.smtp_credentials.is_some(),
+            smtp_auth_required,
             http_tls: http_tls.is_some(),
-            auth_required: auth.is_some(),
+            auth_required: auth.required(),
             max_message_size: config.max_message_size,
             max_messages: config.limits.max_messages,
         };
@@ -201,7 +236,7 @@ impl Emailulator {
             http,
             smtp_config: SmtpConfig {
                 max_message_size: config.max_message_size,
-                credentials: config.smtp_credentials,
+                require_auth: smtp_auth_required,
                 tls: smtp_tls,
                 ..SmtpConfig::default()
             },
@@ -273,18 +308,28 @@ mod tests {
     }
 
     #[test]
-    fn exposed_listeners_need_credentials() {
+    fn exposed_http_needs_the_admin_token() {
         let error = exposed().check().unwrap_err().to_string();
         assert!(error.contains("EMAILULATOR_AUTH_TOKEN"), "{error}");
 
         let mut config = exposed();
         config.auth_token = Some(security::generate_token());
-        let error = config.check().unwrap_err().to_string();
-        assert!(error.contains("EMAILULATOR_SMTP_AUTH"), "{error}");
-
-        config.smtp_credentials = Some(Credentials::parse("app:secret").unwrap());
         let warnings = config.check().unwrap();
         assert_eq!(warnings.len(), 2, "both listeners lack TLS: {warnings:?}");
+    }
+
+    #[test]
+    fn exposed_smtp_requires_an_inbox_key_unless_told_otherwise() {
+        let local = Config {
+            data_dir: None,
+            ..Config::default()
+        };
+        assert!(!local.smtp_requires_auth(), "this machine needs no key");
+
+        let mut config = exposed();
+        assert!(config.smtp_requires_auth());
+        config.allow_anonymous_smtp = true;
+        assert!(!config.smtp_requires_auth());
     }
 
     #[test]
@@ -293,6 +338,43 @@ mod tests {
         config.allow_anonymous_http = true;
         config.allow_anonymous_smtp = true;
         let warnings = config.check().unwrap();
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert_eq!(
+            warnings.len(),
+            3,
+            "open HTTP, open SMTP, no STARTTLS: {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_port_something_else_answers_on_is_refused() {
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = Config {
+            smtp_addr: taken.local_addr().unwrap(),
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            data_dir: None,
+            ..Config::default()
+        };
+        let error = Emailulator::bind(config).await.err().unwrap().to_string();
+        assert!(error.contains("already listening"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn keys_given_in_configuration_are_valid_from_the_start() {
+        let config = Config {
+            smtp_addr: "127.0.0.1:0".parse().unwrap(),
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            data_dir: None,
+            provision: vec![("orders".into(), "a-key-from-the-deployment".into())],
+            ..Config::default()
+        };
+        let server = Emailulator::bind(config).await.unwrap();
+        let store = server.store();
+        assert_eq!(
+            store
+                .inbox_for_key("a-key-from-the-deployment")
+                .unwrap()
+                .as_deref(),
+            Some("orders")
+        );
     }
 }

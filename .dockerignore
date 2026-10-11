@@ -1,0 +1,9 @@
+target
+.git
+.github
+data
+*.db
+*.db-shm
+*.db-wal
+assets
+install.sh

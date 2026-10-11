@@ -1,0 +1,109 @@
+name: Release
+
+# Pushing a tag such as v0.1.0 builds the Linux archives install.sh downloads
+# and leaves them on a DRAFT release. scripts/release.sh, which pushed the tag,
+# then adds the macOS archive it signed and notarized, writes checksums.txt
+# over all of them, and publishes.
+#
+# The macOS build is not made here: its Developer ID certificate lives in a
+# keychain, not in this repository's secrets.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build linux/${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static (musl), so one binary runs on any distro and in a container
+          # with no libc at all. The server alone: the desktop app links the
+          # windowing system, which a headless host does not have.
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TAG }}
+
+      # A tag that disagrees with Cargo.toml would publish a binary whose
+      # --version names a different release than the one it was downloaded as.
+      - name: Check the tag matches the crate version
+        run: |
+          version="${TAG#v}"
+          grep -q "^version = \"${version}\"$" Cargo.toml \
+            || { echo "tag ${TAG} does not match the version in Cargo.toml"; exit 1; }
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          tar -czf "emailulator_${TAG#v}_linux_${{ matrix.arch }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" emailulator
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: emailulator-linux-${{ matrix.arch }}
+          path: emailulator_*.tar.gz
+          if-no-files-found: error
+
+  draft:
+    name: Draft release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      # A draft is invisible to install.sh, which asks for the latest published
+      # release, so a release is never installable while it is incomplete.
+      - name: Attach the Linux archives to a draft release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          draft: true
+          files: dist/emailulator_*.tar.gz
+          fail_on_unmatched_files: true
+          generate_release_notes: true

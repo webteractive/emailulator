@@ -1,0 +1,54 @@
+name: Supply chain
+
+# Policy lives in deny.toml at the repo root. Run the same checks locally with
+# `cargo deny check` before pushing a lockfile change.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  # A new advisory can be published against a lockfile nobody touched, so check
+  # on a timer as well as on commits.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Deterministic gates: these fail only when a change introduces a banned
+  # crate, an unvetted registry or git source, or a disallowed license. Nothing
+  # outside the repo can turn them red, so they are safe to require for merge.
+  gates:
+    name: Bans, licenses, sources
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources
+
+  # Advisories depend on the outside world and can go red with no change to the
+  # code. Kept as its own job so that never masks a real gate failure — require
+  # `gates` for merge and treat this one as a signal to go and patch something.
+  advisories:
+    name: Advisories
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories

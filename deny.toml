@@ -1,0 +1,105 @@
+# cargo-deny policy: supply-chain and license gate.
+#
+#   cargo deny check            # everything
+#   cargo deny check bans       # just the malicious-crate tripwire (offline, fast)
+#   cargo deny check advisories # RustSec vulnerabilities + yanked crates
+
+[graph]
+# Check every target and feature, so a dependency cannot hide behind cfg gating.
+all-features = true
+
+[advisories]
+# Advisories to ignore, each with a reason. Keep this list empty where possible;
+# an entry here is a decision to ship a known issue.
+#
+# Every entry below is an "unmaintained" notice, not a vulnerability, on a crate
+# that gpui 0.2.2 pins transitively. None is in the server build: they are
+# compiled only with the `desktop` feature (`cargo tree -i <crate>` without the
+# feature finds nothing). There is no version of ours to bump; they go when
+# gpui publishes a release that has moved off them. Re-check on every gpui
+# upgrade and delete what no longer applies.
+ignore = [
+    { id = "RUSTSEC-2025-0052", reason = "async-std: discontinued; via gpui 0.2.2, desktop feature only" },
+    { id = "RUSTSEC-2024-0384", reason = "instant: unmaintained; via gpui 0.2.2, desktop feature only" },
+    { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained; via gpui 0.2.2, desktop feature only" },
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: unmaintained; via gpui 0.2.2, desktop feature only" },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2: unmaintained; via gpui 0.2.2, desktop feature only" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile: unmaintained; via gpui 0.2.2, desktop feature only. The server reads PEM with rustls-pki-types instead" },
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz: unmaintained; via gpui 0.2.2 text shaping, desktop feature only" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser: unmaintained; via gpui 0.2.2 font loading, desktop feature only" },
+]
+
+[licenses]
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    # Permissive. Reached through the desktop app's image and vector stack.
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    # Public-domain dedication. hexf-parse and tiny-keccak, under gpui.
+    "CC0-1.0",
+    # ring, rustls-webpki and untrusted: the TLS stack behind HTTPS and STARTTLS.
+    "ISC",
+    "MIT",
+    # Permissive (University of Illinois). libfuzzer-sys, under gpui's image codecs.
+    "NCSA",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+# MPL-2.0 is file-level copyleft: linking carries no obligation, only modifying
+# the crate itself would. It is allowed per crate rather than across the board,
+# so a new one still gets looked at. All but the first are reached only with the
+# `desktop` feature.
+exceptions = [
+    # Reached via dirs -> dirs-sys.
+    { crate = "option-ext", allow = ["MPL-2.0"] },
+    # A build-time tool gpui runs to generate C headers; not linked into the binary.
+    { crate = "cbindgen", allow = ["MPL-2.0"] },
+    # Servo's CSS parsing, used by the webview crate on Linux.
+    { crate = "cssparser", allow = ["MPL-2.0"] },
+    { crate = "cssparser-macros", allow = ["MPL-2.0"] },
+    { crate = "dtoa-short", allow = ["MPL-2.0"] },
+    { crate = "selectors", allow = ["MPL-2.0"] },
+    # DirectWrite bindings, used by gpui on Windows.
+    { crate = "dwrote", allow = ["MPL-2.0"] },
+]
+
+[licenses.private]
+# The workspace crates are unpublished and carry no license field of their own.
+ignore = true
+
+[bans]
+# Duplicate versions are bloat, not a security problem: report, do not fail.
+multiple-versions = "warn"
+# A wildcard version accepts whatever crates.io serves next. That is precisely
+# how a hijacked-account release reaches a build with no diff to review.
+wildcards = "deny"
+deny = [
+    # 2026 arrayref / proc-macro1 build-time RAT.
+    # https://safedep.io/arrayref-proc-macro1-rust-build-time-malware/
+    # The `droundy` account was compromised; arrayref 0.3.10 added an *unused*
+    # dependency on proc-macro1, whose build script downloaded and detached a
+    # second-stage binary (C2 23.254.165.112) during `cargo build`. Cargo
+    # compiles unused deps, so importing nothing was no defence.
+    { crate = "arrayref@=0.3.10", reason = "compromised release; use 0.3.9 or >=0.3.11" },
+    { crate = "internment@=0.8.7", reason = "compromised release from the same account" },
+    { crate = "append-only-vec@=0.1.9", reason = "compromised release from the same account" },
+    { crate = "proc-macro1", reason = "typosquat of proc-macro2; build script drops a RAT" },
+    { crate = "proc-macro-en", reason = "payload-delivery crate from the same campaign" },
+    { crate = "aovine", reason = "payload-delivery crate from the same campaign" },
+    { crate = "arone", reason = "payload-delivery crate from the same campaign" },
+    { crate = "aronenao", reason = "payload-delivery crate from the same campaign" },
+    { crate = "tinymember", reason = "payload-delivery crate from the same campaign" },
+]
+
+[sources]
+# Every crate must come from crates.io. An unvetted registry or a git dependency
+# pointing somewhere new is the other common route a poisoned crate takes in.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

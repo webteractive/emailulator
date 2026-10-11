@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="referrer" content="no-referrer">
+  <title>emailulator</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <noscript><p class="noscript">emailulator's web UI needs JavaScript. The API at <code>/api/v1</code> works without it.</p></noscript>
+
+  <div id="app" class="app" hidden>
+    <aside id="sidebar" class="sidebar" aria-label="Mailboxes">
+      <header class="brand">
+        <img src="icon.svg" alt="" width="20" height="20">
+        <span class="brand-name">emailulator</span>
+        <span id="version" class="brand-version"></span>
+      </header>
+
+      <nav class="nav" aria-label="Views">
+        <ul id="nav-fixed" class="nav-list"></ul>
+        <div class="nav-heading">
+          <span>Mailboxes</span>
+          <span id="mailbox-count" class="nav-heading-count"></span>
+        </div>
+        <label class="visually-hidden" for="mailbox-filter">Filter mailboxes</label>
+        <input id="mailbox-filter" class="field field-small" type="search" placeholder="Filter mailboxes"
+               autocomplete="off" spellcheck="false" hidden>
+        <ul id="nav-mailboxes" class="nav-list"></ul>
+        <p id="nav-empty" class="nav-empty" hidden>Every address that receives mail gets its own mailbox here.</p>
+      </nav>
+
+      <footer class="connect">
+        <h2 class="connect-title">Send mail here</h2>
+        <dl id="connect-info" class="connect-info"></dl>
+        <div class="connect-row">
+          <span id="live" class="live" data-state="connecting">
+            <span class="live-dot" aria-hidden="true"></span>
+            <span id="live-text">Connecting…</span>
+          </span>
+          <button id="sign-out" class="btn btn-quiet" type="button" hidden>Sign out</button>
+        </div>
+      </footer>
+    </aside>
+    <div id="scrim" class="scrim" hidden></div>
+
+    <main id="main" class="main">
+      <section id="list-pane" class="list-pane" aria-label="Messages">
+        <header class="list-head">
+          <button id="menu" class="icon-btn menu-btn" type="button" aria-label="Show mailboxes"></button>
+          <div class="list-title">
+            <h1 id="view-title">All mail</h1>
+            <span id="view-count" class="list-count"></span>
+          </div>
+          <button id="mark-read" class="icon-btn" type="button" aria-label="Mark all read" title="Mark all read"></button>
+          <button id="delete-all" class="icon-btn icon-btn-danger" type="button" aria-label="Delete all" title="Delete all"></button>
+        </header>
+        <div class="search">
+          <label class="visually-hidden" for="search">Search messages</label>
+          <input id="search" class="field" type="search" autocomplete="off" spellcheck="false"
+                 title="Search words, or narrow with from: to: subject: is:unread is:starred has:attachment"
+                 placeholder="Search · from: to: subject: is:unread has:attachment">
+        </div>
+        <div id="list-scroll" class="list-scroll">
+          <ul id="messages" class="messages"></ul>
+          <p id="list-empty" class="list-empty" hidden></p>
+          <button id="load-more" class="btn load-more" type="button" hidden>Load more</button>
+        </div>
+      </section>
+
+      <section id="reader" class="reader" aria-label="Message"></section>
+      <section id="welcome" class="welcome" aria-label="Getting started" hidden></section>
+    </main>
+  </div>
+
+  <div id="login" class="login" hidden>
+    <form id="login-form" class="login-card">
+      <img src="icon.svg" alt="" width="40" height="40">
+      <h1>emailulator</h1>
+      <p class="login-hint">This server is protected. Enter its auth token to read the captured mail.</p>
+      <!-- Gives password managers an account name to file the token under. -->
+      <input class="visually-hidden" type="text" name="username" autocomplete="username" value="emailulator"
+             tabindex="-1" aria-hidden="true" readonly>
+      <label for="token">Auth token</label>
+      <input id="token" class="field" type="password" autocomplete="current-password" required>
+      <p id="login-error" class="form-error" role="alert" hidden></p>
+      <button id="login-submit" class="btn btn-primary" type="submit">Sign in</button>
+    </form>
+  </div>
+
+  <dialog id="confirm" class="dialog" aria-labelledby="confirm-title" aria-describedby="confirm-body">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-body"></p>
+    <div class="dialog-actions">
+      <button id="confirm-cancel" class="btn" type="button">Cancel</button>
+      <button id="confirm-ok" class="btn btn-danger" type="button">Delete</button>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

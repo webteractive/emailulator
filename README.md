@@ -6,8 +6,8 @@ Catch the email your application sends in development. Nothing is ever
 delivered: every message is stored and shown to you instead.
 
 - **In** over SMTP or an HTTP API.
-- **Out** through a web UI, a REST API, an MCP server for agents, and a native
-  desktop app.
+- **Out** through a web UI, a REST API, an MCP server for agents, and a
+  desktop app that shows the same web UI in a window of its own.
 - **Inboxes, one per app.** Each inbox has its own API keys. A key is what lets
   an app deliver into the inbox, and what confines a reader — a script, an
   agent — to it.
@@ -65,6 +65,11 @@ MAIL_HOST=127.0.0.1
 MAIL_PORT=1025
 ```
 
+In the web UI, `j`/`k` move between messages, `s` stars, `u` marks unread, `#`
+deletes and `/` searches. Drag the edge of the inbox sidebar or the message
+list to resize it, or focus the edge and use the arrow keys; a double-click
+restores the default. Widths are remembered in that browser.
+
 With no options it listens on this machine only and needs no credentials.
 Messages are kept in the platform data directory
 (`~/Library/Application Support/emailulator` on macOS,
@@ -118,6 +123,12 @@ the API and MCP, and signs the web UI in to a view of that inbox alone.
   kept; `key list` shows its first characters and whether it has been used.
 - `default` always exists and cannot be deleted. It is where mail without a key
   goes, which is what keeps a local setup working with nothing configured.
+- `default` also comes with a **starter key**, made the first time a store is
+  opened, so there is a key to hand an app without making one. It is the one
+  key kept readable: the Connect panel, `emailulator key list` and the admin
+  API show it in full. Regenerate it before an app outside this machine uses
+  it; the new value is an ordinary key, kept only as a hash and shown once. A
+  revoked starter key is not made again.
 - Deleting an inbox deletes its messages and keys.
 
 `inbox` and `key` work on the message store on this machine, as the web UI and
@@ -265,29 +276,20 @@ it, repeat.
 emailulator app
 ```
 
-A native mail client built with [gpui](https://www.gpui.rs): inboxes, message
-list, reading pane, search, and HTML, text, headers, raw, links and check views,
-with the HTML view at desktop, tablet or mobile width. It is
-part of the `emailulator` binary on macOS, and the command returns as soon as the
-window is open (`--foreground` keeps it attached to the terminal).
-
-**New** in the sidebar creates an inbox: give it a name and it shows the id and
-key it will have before you confirm. **Connect**, at the top of an inbox, shows
-what an app needs to deliver into it — host, port, the inbox id as username —
-and creates, regenerates and revokes its keys. A new key is shown until you
-leave the inbox.
+The web UI in a window of its own, with a Dock icon and a menu bar: everything
+the web UI does, the app does, because it is the same page. It is part of the
+`emailulator` binary on macOS, and the command returns as soon as the window is
+open (`--foreground` keeps it attached to the terminal). **Open in Browser**
+(⇧⌘O) opens the same server in your browser.
 
 The app runs the same SMTP and HTTP servers inside itself, on this machine only,
 and reads the same message store as `emailulator run`. If ports 1025 and 8025
 are taken — by another mail catcher, say — it uses 1026 and 8026 (then 2525 and
 8525) and shows which in the sidebar. `--smtp-addr`, `--http-addr` and
-`--data-dir` work as they do for `run`.
+`--data-dir` work as they do for `run`. If the app cannot start its servers at
+all, the window says why instead.
 
-Keys: `j`/`k` or arrows to move, `s` star, `u` unread, `#` or delete to delete,
-`/` or `⌘F` to search, `Esc` to clear.
-
-Message bodies render in the system webview with JavaScript disabled. The app is
-a local tool: it does not connect to a remote emailulator.
+The app is a local tool: it does not connect to a remote emailulator.
 
 The Linux release is the server alone, because a binary that links the windowing
 system cannot start on a headless host. There, `emailulator app` says so; use the
@@ -376,8 +378,10 @@ content is written by whoever sends it. The design assumes both.
   manages inboxes and keys. An **inbox API key** reaches the messages of one
   inbox and nothing else: not other inboxes, not their existence, not key
   management.
-- Keys are stored as SHA-256 hashes and shown once. Revoking or regenerating a
-  key also ends any browser session opened with it.
+- Keys are stored as SHA-256 hashes and shown once. The exception is the default
+  inbox's starter key, which is also kept readable in the database until it is
+  regenerated, so anyone who can read that file can read it. Revoking or
+  regenerating a key also ends any browser session opened with it.
 - The web UI signs in with either credential and gets a random session id in an
   `HttpOnly; SameSite=Strict` cookie (`Secure` over HTTPS); the credential
   itself is never stored in the browser. Sessions end on sign-out, after seven
@@ -404,9 +408,10 @@ content is written by whoever sends it. The design assumes both.
 - Attachments are always downloads, also sandboxed, with `nosniff`.
 - The web UI builds the page from text nodes only and runs under
   `default-src 'self'`, with no inline script or style.
-- The desktop app's webview has JavaScript disabled, may not navigate, and opens
-  a link in your browser only when you click it. Saved attachments are written
-  to Downloads under a sanitized name and never overwrite a file.
+- The desktop app's webview may load only the app's own server, in the page and
+  in the frame an email is shown in, and opens a link in your browser only when
+  you click it. Saved attachments and messages are written to Downloads and
+  never overwrite a file.
 - Remote images in an email **are** loaded when you view it, as a mail client
   would, so the sender's server learns that you did.
 
@@ -423,7 +428,7 @@ at rest.
 
 ```sh
 cargo test                           # the server
-cargo test --features desktop-test   # plus the desktop app, driven headlessly
+cargo test --features desktop        # plus the desktop app's own tests
 cargo run --features desktop -- app  # the desktop app from source
 cargo deny check                     # licenses, sources, advisories, banned crates
 ```
@@ -433,8 +438,9 @@ needs no rebuild. It is plain HTML, CSS and one ES module: no build step.
 
 The desktop app can test itself against a real window: set
 `EMAILULATOR_APP_SELFTEST=1` and run `emailulator app --foreground` with a
-scratch `--data-dir`. It opens a message, visits every tab, and exits non-zero
-if the message view did not come up.
+scratch `--data-dir`. It delivers a message through its own API, waits for the
+web UI in the window to show it, and exits non-zero if it does not within 30
+seconds.
 
 ## Releasing
 

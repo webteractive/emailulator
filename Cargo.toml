@@ -7,12 +7,10 @@ rust-version = "1.88"
 publish = false
 
 [features]
-# The gpui desktop app behind `emailulator app`. Off by default so that the
-# server builds anywhere, statically, with no windowing libraries; the macOS
-# release turns it on.
-desktop = ["dep:chrono", "dep:futures", "dep:gpui", "dep:objc2", "dep:unicode-segmentation", "dep:wry"]
-# The desktop app plus gpui's headless test window, for `cargo test`.
-desktop-test = ["desktop", "gpui/test-support"]
+# The desktop app behind `emailulator app`: the web UI in a window of its own.
+# Off by default so that the server builds anywhere, statically, with no
+# windowing libraries; the macOS release turns it on.
+desktop = ["dep:muda", "dep:objc2", "dep:tao", "dep:wry"]
 
 [dependencies]
 anyhow = "1"
@@ -35,16 +33,12 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
-# Desktop app only.
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
-futures = { version = "0.3", optional = true }
-# runtime_shaders: compile Metal shaders at launch, so building needs no Xcode Metal toolchain.
-gpui = { version = "0.2.2", features = ["runtime_shaders"], optional = true }
-unicode-segmentation = { version = "1", optional = true }
-
-# The system webview renders message bodies in the desktop app. wry can only
-# attach a child webview to a window it does not own on these two platforms.
+# The desktop app: a tao window holding the system webview, with a muda menu
+# bar. On Linux wry and muda need GTK and WebKitGTK, which the server release
+# must not link, so the app is built for macOS and Windows only.
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+muda = { version = "0.21", optional = true }
+tao = { version = "0.37", optional = true }
 wry = { version = "0.57", default-features = false, features = ["os-webview"], optional = true }
 
 # Sets the Dock icon. A bare binary has no app bundle to carry one, so the app

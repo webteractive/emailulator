@@ -405,6 +405,7 @@ async function loadKeys() {
     if (seq !== keysSeq || state.panel !== 'connect' || state.view.id !== inbox) return;
     state.keys = { inbox, list: data.keys };
     renderKeys();
+    renderSnippets();
   } catch (error) {
     // 404: the inbox went away; the inbox list notices and leaves.
     if (seq === keysSeq && error.status !== 404) report(error);
@@ -1656,6 +1657,30 @@ function renderKeys() {
     return;
   }
   const keys = state.keys.list;
+  const starter = keys.find((key) => key.key);
+  // The starter key is the one key kept readable. Show it in full, and say why
+  // it should be replaced before it travels.
+  const starterBlock = starter
+    ? h(
+        'div',
+        { class: 'starter-key' },
+        h('p', { class: 'fresh-key-title', text: 'Starter key' }),
+        h(
+          'div',
+          { class: 'fresh-key-row' },
+          h('code', { class: 'fresh-key-value', text: starter.key }),
+          copyButton(starter.key),
+        ),
+        h(
+          'p',
+          { class: 'fresh-key-note' },
+          'Made for you when this server first started, and kept readable so it can be shown here. ' +
+            'Before an app outside this machine uses it, ',
+          h('button', { class: 'link-btn', type: 'button', onclick: () => regenerateKey(starter) }, 'regenerate it'),
+          ': the new key is kept only as a hash and shown once.',
+        ),
+      )
+    : null;
   if (!keys.length) {
     root.replaceChildren(
       h('p', {
@@ -1668,7 +1693,9 @@ function renderKeys() {
     );
     return;
   }
-  root.replaceChildren(
+  fill(
+    root,
+    starterBlock,
     h(
       'table',
       { class: 'keys' },
@@ -1720,7 +1747,6 @@ function renderConnectPanel(root) {
   const { host, port } = smtpEndpoint();
   const inbox = state.inboxes.find((candidate) => candidate.id === id);
   const fresh = freshKey && freshKey.inbox === id ? freshKey : null;
-  const { env, curl, mcp } = snippets(id, fresh ? fresh.key : '<API key>');
   const close = () => setRoute({ panel: null });
 
   const lead = isDefault
@@ -1810,17 +1836,7 @@ function renderConnectPanel(root) {
             text: 'You are signed in with one of this inbox’s API keys. Creating and revoking keys takes the admin token.',
           }),
 
-      h(
-        'section',
-        { class: 'panel-section', 'aria-labelledby': 'snippets-title' },
-        h('h3', { id: 'snippets-title', text: 'Paste into your app' }),
-        fresh
-          ? null
-          : h('p', { class: 'hint', text: 'Replace <API key> with a key. A key is shown in full only when it is created.' }),
-        codeBlock('Laravel .env', env),
-        codeBlock('Send over HTTP', curl),
-        codeBlock('Give an agent this inbox (Claude Code)', mcp),
-      ),
+      h('section', { id: 'snippets', class: 'panel-section', 'aria-labelledby': 'snippets-title' }),
 
       admin && !isDefault
         ? h(
@@ -1834,6 +1850,31 @@ function renderConnectPanel(root) {
     ),
   );
   renderKeys();
+  renderSnippets();
+}
+
+/** The connect panel's snippets, filled with a key when one can be shown. */
+function renderSnippets() {
+  const root = $('snippets');
+  if (!root) return;
+  const id = state.view.id;
+  const fresh = freshKey && freshKey.inbox === id ? freshKey : null;
+  const starter =
+    state.keys && state.keys.inbox === id ? state.keys.list.find((key) => key.key) : null;
+  const key = fresh ? fresh.key : starter ? starter.key : null;
+  const { env, curl, mcp } = snippets(id, key || '<API key>');
+  fill(
+    root,
+    h('h3', { id: 'snippets-title', text: 'Paste into your app' }),
+    key
+      ? starter && !fresh
+        ? h('p', { class: 'hint', text: 'These use the starter key.' })
+        : null
+      : h('p', { class: 'hint', text: 'Replace <API key> with a key. A key is shown in full only when it is created.' }),
+    codeBlock('Laravel .env', env),
+    codeBlock('Send over HTTP', curl),
+    codeBlock('Give an agent this inbox (Claude Code)', mcp),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -2226,7 +2267,107 @@ async function start() {
   connectEvents();
 }
 
+// The two panes beside the reader can be resized by dragging their right edge,
+// or with the arrow keys on the handle; a double-click restores the default.
+// Each width is kept in this browser only, and is clamped so the reader always
+// keeps room to read in.
+const PANES = {
+  sidebar: { property: '--sidebar-width', initial: 232, min: 180, max: 400 },
+  list: { property: '--list-width', initial: 360, min: 260, max: 640 },
+};
+const READER_MIN = 400;
+
+function paneStore(name, width) {
+  const key = `emailulator.pane.${name}`;
+  try {
+    if (width === undefined) return Number(localStorage.getItem(key)) || null;
+    if (width === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, String(width));
+  } catch {
+    // Storage blocked or unavailable: widths last for this visit only.
+  }
+  return null;
+}
+
+function paneWidth(name) {
+  const value = getComputedStyle(document.documentElement).getPropertyValue(PANES[name].property);
+  return parseFloat(value) || PANES[name].initial;
+}
+
+function paneMax(name) {
+  const pane = PANES[name];
+  const other = name === 'sidebar' ? paneWidth('list') : paneWidth('sidebar');
+  return Math.max(pane.min, Math.min(pane.max, window.innerWidth - other - READER_MIN));
+}
+
+function setPaneWidth(name, width) {
+  const pane = PANES[name];
+  const clamped = Math.round(Math.min(Math.max(width, pane.min), paneMax(name)));
+  document.documentElement.style.setProperty(pane.property, `${clamped}px`);
+  const handle = document.querySelector(`.resizer[data-resize="${name}"]`);
+  if (handle) {
+    handle.setAttribute('aria-valuenow', String(clamped));
+    handle.setAttribute('aria-valuemin', String(pane.min));
+    handle.setAttribute('aria-valuemax', String(paneMax(name)));
+  }
+  return clamped;
+}
+
+function bindResizers() {
+  for (const name of Object.keys(PANES)) setPaneWidth(name, paneStore(name) ?? PANES[name].initial);
+
+  for (const handle of document.querySelectorAll('.resizer')) {
+    const name = handle.dataset.resize;
+    const pane = handle.parentElement;
+
+    handle.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      handle.setPointerCapture(event.pointerId);
+      handle.classList.add('is-active');
+      document.body.classList.add('is-resizing');
+      const left = pane.getBoundingClientRect().left;
+      const move = (moved) => setPaneWidth(name, moved.clientX - left);
+      const end = () => {
+        handle.removeEventListener('pointermove', move);
+        handle.classList.remove('is-active');
+        document.body.classList.remove('is-resizing');
+        paneStore(name, paneWidth(name));
+      };
+      handle.addEventListener('pointermove', move);
+      handle.addEventListener('lostpointercapture', end, { once: true });
+    });
+
+    handle.addEventListener('dblclick', () => {
+      setPaneWidth(name, PANES[name].initial);
+      paneStore(name, null);
+    });
+
+    handle.addEventListener('keydown', (event) => {
+      const step = event.shiftKey ? 48 : 16;
+      const width = paneWidth(name);
+      let next;
+      if (event.key === 'ArrowLeft') next = width - step;
+      else if (event.key === 'ArrowRight') next = width + step;
+      else if (event.key === 'Home') next = PANES[name].min;
+      else if (event.key === 'End') next = paneMax(name);
+      else return;
+      event.preventDefault();
+      // The global shortcuts must not also see these keys.
+      event.stopPropagation();
+      paneStore(name, setPaneWidth(name, next));
+    });
+  }
+
+  // A smaller window takes room from the panes before the reader; a larger one
+  // gives them back the width that was chosen.
+  window.addEventListener('resize', () => {
+    for (const name of Object.keys(PANES)) setPaneWidth(name, paneStore(name) ?? PANES[name].initial);
+  });
+}
+
 async function boot() {
+  bindResizers();
   bind();
   try {
     const session = await api('/api/v1/session');

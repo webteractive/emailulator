@@ -130,7 +130,7 @@ fi
 
 # --- Gate on the tests -------------------------------------------------------
 echo "==> cargo test"
-cargo test --locked --features desktop-test >/dev/null 2>&1 || die "tests failed — not releasing"
+cargo test --locked --features desktop >/dev/null 2>&1 || die "tests failed — not releasing"
 
 # --- Bump + commit (local only, for now) -------------------------------------
 if [ "$VERSION" != "$CURRENT" ]; then

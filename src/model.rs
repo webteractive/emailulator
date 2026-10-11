@@ -125,7 +125,9 @@ pub struct Inbox {
     pub keys: usize,
 }
 
-/// An API key as it can be shown after creation: never the key itself.
+/// An API key as it can be shown after creation: never the key itself, except
+/// for the default inbox's starter key, which is kept readable until it is
+/// regenerated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiKey {
     pub id: i64,
@@ -135,6 +137,9 @@ pub struct ApiKey {
     pub prefix: String,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
+    /// The key itself, for the starter key only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

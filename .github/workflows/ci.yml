@@ -31,8 +31,8 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-  # The same binary with the desktop app compiled in. gpui needs a windowing
-  # stack to build; macOS runners have one out of the box.
+  # The same binary with the desktop app compiled in. tao and wry link the
+  # windowing system and its webview; macOS runners have both out of the box.
   desktop:
     name: With desktop app
     runs-on: macos-latest
@@ -42,7 +42,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Lint
-        run: cargo clippy --all-targets --features desktop-test --locked -- -D warnings
+        run: cargo clippy --all-targets --features desktop --locked -- -D warnings
 
       - name: Test
-        run: cargo test --features desktop-test --locked
+        run: cargo test --features desktop --locked

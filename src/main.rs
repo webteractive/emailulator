@@ -1,4 +1,4 @@
-#[cfg(feature = "desktop")]
+#[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
 mod desktop;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -42,9 +42,10 @@ enum Command {
     Run(Box<RunArgs>),
     /// Open the desktop app
     #[command(
-        long_about = "Open the desktop app: a native mail client that runs the SMTP and HTTP \
-            servers itself, on this machine only, so there is nothing else to start. If the \
-            ports are already taken by `emailulator run`, it shows that server's mail instead.\n\n\
+        long_about = "Open the desktop app: the web UI in a window of its own. It runs the SMTP \
+            and HTTP servers itself, on this machine only, so there is nothing else to start. \
+            If the usual ports are taken, by `emailulator run` or another mail catcher, it \
+            moves to 1026 and 8026, then 2525 and 8525, then 2526 and 8526.\n\n\
             The app is part of this program on macOS. The Linux build is the server alone and \
             has no app; use the web UI from `emailulator run` there."
     )]
@@ -90,7 +91,8 @@ enum InboxCommand {
 
 #[derive(Subcommand)]
 enum KeyCommand {
-    /// List an inbox's keys, or every key. Keys themselves are never shown again
+    /// List an inbox's keys, or every key. Keys themselves are never shown again,
+    /// except the default inbox's starter key until it is regenerated
     List {
         /// Only this inbox's keys, by its id or name
         inbox: Option<String>,
@@ -628,6 +630,17 @@ fn key_command(command: KeyCommand) -> Result<()> {
                     key.label
                 );
             }
+            for key in &keys {
+                if let Some(value) = &key.key {
+                    println!(
+                        "\nThe {} inbox's starter key: {value}\n\
+                         It is kept readable so it can be shown here. Before an application \
+                         outside this machine uses it, replace it with one that is kept only \
+                         as a hash: `emailulator key regenerate {}`.",
+                        key.inbox, key.id
+                    );
+                }
+            }
             println!("\nRevoke one with `emailulator key revoke <id>`. For scripts: add --json.");
             Ok(())
         }
@@ -671,8 +684,8 @@ fn key_command(command: KeyCommand) -> Result<()> {
 }
 
 /// Open the desktop app, which is compiled into this binary when it is built
-/// with the `desktop` feature.
-#[cfg(feature = "desktop")]
+/// with the `desktop` feature on macOS or Windows.
+#[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
 fn open_app(args: AppArgs) -> Result<()> {
     if args.foreground {
         desktop::run(desktop::Options {
@@ -715,7 +728,7 @@ fn open_app(args: AppArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "desktop"))]
+#[cfg(not(all(feature = "desktop", any(target_os = "macos", target_os = "windows"))))]
 fn open_app(_args: AppArgs) -> Result<()> {
     bail!(
         "this build of emailulator has no desktop app: it is the server-only build, which is \

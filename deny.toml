@@ -5,28 +5,28 @@
 #   cargo deny check advisories # RustSec vulnerabilities + yanked crates
 
 [graph]
-# Check every target and feature, so a dependency cannot hide behind cfg gating.
+# Check every feature, on every target a binary is built for: the macOS and
+# Windows app and the static Linux server. Without a list, cargo-deny also
+# walks dependencies for targets nothing builds, such as the GTK stack wry and
+# tao would use for an app on Linux, which the desktop feature never enables.
 all-features = true
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
 
 [advisories]
 # Advisories to ignore, each with a reason. Keep this list empty where possible;
 # an entry here is a decision to ship a known issue.
-#
-# Every entry below is an "unmaintained" notice, not a vulnerability, on a crate
-# that gpui 0.2.2 pins transitively. None is in the server build: they are
-# compiled only with the `desktop` feature (`cargo tree -i <crate>` without the
-# feature finds nothing). There is no version of ours to bump; they go when
-# gpui publishes a release that has moved off them. Re-check on every gpui
-# upgrade and delete what no longer applies.
 ignore = [
-    { id = "RUSTSEC-2025-0052", reason = "async-std: discontinued; via gpui 0.2.2, desktop feature only" },
-    { id = "RUSTSEC-2024-0384", reason = "instant: unmaintained; via gpui 0.2.2, desktop feature only" },
-    { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained; via gpui 0.2.2, desktop feature only" },
-    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: unmaintained; via gpui 0.2.2, desktop feature only" },
-    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2: unmaintained; via gpui 0.2.2, desktop feature only" },
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile: unmaintained; via gpui 0.2.2, desktop feature only. The server reads PEM with rustls-pki-types instead" },
-    { id = "RUSTSEC-2026-0206", reason = "rustybuzz: unmaintained; via gpui 0.2.2 text shaping, desktop feature only" },
-    { id = "RUSTSEC-2026-0192", reason = "ttf-parser: unmaintained; via gpui 0.2.2 font loading, desktop feature only" },
+    # Reached only through glib-macros and gtk3-macros, in the GTK stack that
+    # wry, tao and muda use on Linux. The desktop dependencies are limited to
+    # macOS and Windows, and `cargo tree --features desktop --target <t> -i gtk`
+    # finds nothing for any target in [graph]; cargo-deny keeps the GTK side of
+    # those crates in its graph regardless.
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: unmaintained; via the GTK stack wry, tao and muda use on Linux, which no built target compiles" },
 ]
 
 [licenses]
@@ -34,38 +34,23 @@ allow = [
     "0BSD",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
-    "BSD-1-Clause",
-    # Permissive. Reached through the desktop app's image and vector stack.
-    "BSD-2-Clause",
     "BSD-3-Clause",
     "BSL-1.0",
-    # Public-domain dedication. hexf-parse and tiny-keccak, under gpui.
+    # Public-domain dedication.
     "CC0-1.0",
     # ring, rustls-webpki and untrusted: the TLS stack behind HTTPS and STARTTLS.
     "ISC",
     "MIT",
-    # Permissive (University of Illinois). libfuzzer-sys, under gpui's image codecs.
-    "NCSA",
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
 ]
 # MPL-2.0 is file-level copyleft: linking carries no obligation, only modifying
 # the crate itself would. It is allowed per crate rather than across the board,
-# so a new one still gets looked at. All but the first are reached only with the
-# `desktop` feature.
+# so a new one still gets looked at.
 exceptions = [
     # Reached via dirs -> dirs-sys.
     { crate = "option-ext", allow = ["MPL-2.0"] },
-    # A build-time tool gpui runs to generate C headers; not linked into the binary.
-    { crate = "cbindgen", allow = ["MPL-2.0"] },
-    # Servo's CSS parsing, used by the webview crate on Linux.
-    { crate = "cssparser", allow = ["MPL-2.0"] },
-    { crate = "cssparser-macros", allow = ["MPL-2.0"] },
-    { crate = "dtoa-short", allow = ["MPL-2.0"] },
-    { crate = "selectors", allow = ["MPL-2.0"] },
-    # DirectWrite bindings, used by gpui on Windows.
-    { crate = "dwrote", allow = ["MPL-2.0"] },
 ]
 
 [licenses.private]

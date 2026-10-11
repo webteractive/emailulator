@@ -111,7 +111,7 @@ fi
 codesign --verify --strict --verbose=2 "$BIN"
 
 # The hardened runtime restricts what a process may load, and the desktop app
-# brings up Metal and the system webview. Prove the signed binary still opens a
+# brings up the system webview. Prove the signed binary still opens a
 # message before asking Apple to notarize it. Ephemeral ports, scratch store.
 echo "==> self-testing the signed binary"
 EMAILULATOR_APP_SELFTEST=1 "$BIN" app --foreground \

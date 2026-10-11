@@ -299,16 +299,22 @@ kbd {
 
 /* -------------------------------------------------------------------- layout */
 
+/* Pane widths; the resizers set them, within bounds app.js keeps. */
+:root {
+  --sidebar-width: 232px;
+  --list-width: 360px;
+}
+
 .app {
   display: grid;
-  grid-template-columns: 232px minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   height: 100vh;
   height: 100dvh;
 }
 
 .main {
   display: grid;
-  grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+  grid-template-columns: var(--list-width) minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
 }
@@ -325,8 +331,10 @@ kbd {
 /* ------------------------------------------------------------------- sidebar */
 
 .sidebar {
+  position: relative;
   display: flex;
   flex-direction: column;
+  min-width: 0;
   min-height: 0;
   border-right: 1px solid var(--border);
   background: var(--bg-side);
@@ -514,6 +522,7 @@ kbd {
 /* ---------------------------------------------------------------------- list */
 
 .list-pane {
+  position: relative;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -1197,6 +1206,49 @@ kbd {
   transform: translateX(-50%);
 }
 
+/* A drag handle over a pane's right border. It is wider than it looks, so it
+   is easy to grab, and shows itself as an accent line. */
+.resizer {
+  position: absolute;
+  top: 0;
+  right: -4px;
+  bottom: 0;
+  z-index: 5;
+  width: 8px;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.resizer::after {
+  content: "";
+  position: absolute;
+  inset: 0 3px;
+  background: transparent;
+  transition: background-color 0.12s ease 0.08s;
+}
+
+.resizer:hover::after,
+.resizer:focus-visible::after,
+.is-resizing .resizer.is-active::after {
+  background: var(--accent);
+}
+
+.resizer:focus-visible {
+  outline: none;
+}
+
+/* While dragging, the pointer keeps its shape over everything, and the message
+   frame cannot swallow the pointer. */
+.is-resizing,
+.is-resizing * {
+  cursor: col-resize !important;
+  user-select: none;
+}
+
+.is-resizing iframe {
+  pointer-events: none;
+}
+
 /* ---------------------------------------------------------------- responsive */
 
 @media (max-width: 1000px) {
@@ -1223,6 +1275,11 @@ kbd {
   .menu-btn {
     display: inline-flex;
   }
+
+  /* The sidebar is a drawer here, at its own width. */
+  .resizer[data-resize="sidebar"] {
+    display: none;
+  }
 }
 
 @media (max-width: 720px) {
@@ -1232,6 +1289,10 @@ kbd {
 
   .list-pane {
     border-right: 0;
+  }
+
+  .resizer[data-resize="list"] {
+    display: none;
   }
 
   body[data-pane="reader"] .list-pane,
@@ -1494,6 +1555,30 @@ h3 {
 .key-form .field {
   flex: 1;
   min-width: 0;
+}
+
+/* The starter key: readable, so shown every time, with the advice to replace it. */
+.starter-key {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--bg-raised);
+}
+
+/* A button that sits in a sentence and reads as a link. */
+.link-btn {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent-text);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.link-btn:hover {
+  color: var(--accent);
 }
 
 /* A key on its one showing. */

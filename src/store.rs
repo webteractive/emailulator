@@ -51,8 +51,15 @@ CREATE TABLE IF NOT EXISTS api_keys (
     prefix       TEXT    NOT NULL,
     hash         TEXT    NOT NULL UNIQUE,
     created_at   INTEGER NOT NULL,
-    last_used_at INTEGER
+    last_used_at INTEGER,
+    -- The key itself, kept only for the default inbox's starter key.
+    secret       TEXT
 );
+-- One-off facts about the store, such as setup steps already taken.
+CREATE TABLE IF NOT EXISTS meta (
+    name  TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS messages (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     inbox            TEXT    NOT NULL DEFAULT 'default',
@@ -393,10 +400,58 @@ fn key_from_row(row: &Row<'_>) -> rusqlite::Result<ApiKey> {
         prefix: row.get(3)?,
         created_at: row.get(4)?,
         last_used_at: row.get(5)?,
+        key: row.get(6)?,
     })
 }
 
-const KEY_COLUMNS: &str = "id, inbox, label, prefix, created_at, last_used_at";
+const KEY_COLUMNS: &str = "id, inbox, label, prefix, created_at, last_used_at, secret";
+
+/// The label of the default inbox's starter key.
+pub const STARTER_KEY_LABEL: &str = "starter key";
+
+/// Give the default inbox a key of its own the first time a store is opened,
+/// so there is one to hand an application without making one first. Unlike
+/// every other key it is kept readable, so the UI and `emailulator key list`
+/// can show it again; regenerating it replaces it with an ordinary key, kept
+/// only as a hash. It is made once per store: a store whose starter key was
+/// revoked does not get another.
+fn create_starter_key(conn: &Connection) -> Result<()> {
+    const DONE: &str = "starter_key_created";
+    let done: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE name = ?)",
+        [DONE],
+        |row| row.get(0),
+    )?;
+    if done {
+        return Ok(());
+    }
+    let has_key: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM api_keys WHERE inbox = ?)",
+        [DEFAULT_INBOX],
+        |row| row.get(0),
+    )?;
+    // A default inbox that already has keys was set up by hand; leave it be.
+    if !has_key {
+        let key = generate_api_key();
+        conn.execute(
+            "INSERT INTO api_keys (inbox, label, prefix, hash, created_at, secret) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![
+                DEFAULT_INBOX,
+                STARTER_KEY_LABEL,
+                key_prefix(&key),
+                hash_api_key(&key),
+                now_ms(),
+                key
+            ],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO meta (name, value) VALUES (?, ?)",
+        params![DONE, now_ms().to_string()],
+    )?;
+    Ok(())
+}
 
 /// Enough of a key to recognize it by, and nothing that helps guess the rest.
 fn key_prefix(key: &str) -> String {
@@ -469,6 +524,17 @@ impl Store {
             [],
         )?;
         conn.execute("UPDATE inboxes SET name = id WHERE name = ''", [])?;
+
+        // Keys were once kept only as hashes.
+        let has_secret: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('api_keys') WHERE name = 'secret'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_secret == 0 {
+            conn.execute_batch("ALTER TABLE api_keys ADD COLUMN secret TEXT")?;
+        }
+        create_starter_key(&conn)?;
 
         let (events, _) = broadcast::channel(256);
         Ok(Self {
@@ -788,9 +854,11 @@ impl Store {
         let key = generate_api_key();
         let record = {
             let conn = self.conn();
+            // A regenerated key is an ordinary one, kept only as a hash, even
+            // when it replaces the readable starter key.
             let changed = conn.execute(
-                "UPDATE api_keys SET hash = ?1, prefix = ?2, created_at = ?3, last_used_at = NULL \
-                 WHERE id = ?4 AND (?5 IS NULL OR inbox = ?5)",
+                "UPDATE api_keys SET hash = ?1, prefix = ?2, created_at = ?3, last_used_at = NULL, \
+                 secret = NULL WHERE id = ?4 AND (?5 IS NULL OR inbox = ?5)",
                 params![hash_api_key(&key), key_prefix(&key), now_ms(), id, inbox],
             )?;
             if changed == 0 {
@@ -1576,7 +1644,13 @@ mod tests {
         store.delete_inbox("billing").unwrap();
         assert_eq!(store.list(&all()).unwrap().total, 1);
         assert!(store.inbox_for_key(&key).unwrap().is_none());
-        assert!(store.keys(None).unwrap().is_empty());
+        assert!(
+            store
+                .keys(None)
+                .unwrap()
+                .iter()
+                .all(|k| k.inbox == DEFAULT_INBOX)
+        );
         assert!(store.delete_inbox("billing").is_err(), "it is gone");
     }
 
@@ -1887,6 +1961,118 @@ mod tests {
                 inbox: "billing".into()
             }
         );
+    }
+
+    fn scratch_db(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("emailulator-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.db");
+        (dir, path)
+    }
+
+    #[test]
+    fn the_default_inbox_starts_with_a_readable_key() {
+        let store = Store::in_memory().unwrap();
+        let keys = store.keys(Some(DEFAULT_INBOX)).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].label, STARTER_KEY_LABEL);
+        let key = keys[0].key.clone().expect("the starter key is readable");
+        assert!(key.starts_with(&keys[0].prefix));
+        assert_eq!(
+            store.inbox_for_key(&key).unwrap().as_deref(),
+            Some(DEFAULT_INBOX)
+        );
+
+        // Every other key stays hash-only.
+        store.create_inbox("billing").unwrap();
+        store.create_key("billing", "ci").unwrap();
+        assert!(store.keys(Some("billing")).unwrap()[0].key.is_none());
+    }
+
+    #[test]
+    fn regenerating_the_starter_key_makes_it_an_ordinary_key() {
+        let store = Store::in_memory().unwrap();
+        let starter = store.keys(Some(DEFAULT_INBOX)).unwrap().remove(0);
+        let old = starter.key.clone().unwrap();
+        let (renewed, new) = store.regenerate_key(starter.id, None).unwrap().unwrap();
+        assert!(
+            renewed.key.is_none(),
+            "the new value is shown once, not kept"
+        );
+        assert!(store.keys(Some(DEFAULT_INBOX)).unwrap()[0].key.is_none());
+        assert!(store.inbox_for_key(&old).unwrap().is_none());
+        assert_eq!(
+            store.inbox_for_key(&new).unwrap().as_deref(),
+            Some(DEFAULT_INBOX)
+        );
+    }
+
+    #[test]
+    fn a_revoked_starter_key_does_not_come_back() {
+        let (dir, path) = scratch_db("starter-revoked");
+        let store = Store::open(Some(&path), Limits::default()).unwrap();
+        let starter = store.keys(Some(DEFAULT_INBOX)).unwrap().remove(0);
+        assert!(store.revoke_key(starter.id, None).unwrap());
+        drop(store);
+
+        let store = Store::open(Some(&path), Limits::default()).unwrap();
+        assert!(store.keys(Some(DEFAULT_INBOX)).unwrap().is_empty());
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_store_with_hash_only_keys_gains_a_starter_key() {
+        let (dir, path) = scratch_db("starter-migrate");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE inboxes (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, \
+                 name TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '') WITHOUT ROWID;
+                 CREATE TABLE api_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 inbox TEXT NOT NULL REFERENCES inboxes(id) ON DELETE CASCADE, label TEXT NOT NULL, \
+                 prefix TEXT NOT NULL, hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, \
+                 last_used_at INTEGER);
+                 INSERT INTO inboxes (id, created_at, name) VALUES ('billing', 1, 'Billing');
+                 INSERT INTO api_keys (inbox, label, prefix, hash, created_at) \
+                 VALUES ('billing', 'ci', 'emu_abc', 'not-a-real-hash', 1);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(Some(&path), Limits::default()).unwrap();
+        assert!(store.keys(Some("billing")).unwrap()[0].key.is_none());
+        let starter = store.keys(Some(DEFAULT_INBOX)).unwrap();
+        assert_eq!(starter.len(), 1);
+        assert!(starter[0].key.is_some());
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_default_inbox_with_keys_gets_no_starter_key() {
+        let (dir, path) = scratch_db("starter-existing");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE inboxes (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, \
+                 name TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '') WITHOUT ROWID;
+                 CREATE TABLE api_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 inbox TEXT NOT NULL REFERENCES inboxes(id) ON DELETE CASCADE, label TEXT NOT NULL, \
+                 prefix TEXT NOT NULL, hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, \
+                 last_used_at INTEGER);
+                 INSERT INTO inboxes (id, created_at, name) VALUES ('default', 1, 'Default');
+                 INSERT INTO api_keys (inbox, label, prefix, hash, created_at) \
+                 VALUES ('default', 'ci', 'emu_abc', 'not-a-real-hash', 1);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(Some(&path), Limits::default()).unwrap();
+        let keys = store.keys(Some(DEFAULT_INBOX)).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].label, "ci");
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

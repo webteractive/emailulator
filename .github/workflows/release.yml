@@ -37,8 +37,10 @@ jobs:
         include:
           # Static (musl), so one binary runs on any distro and in a container
           # with no libc at all. The server alone: the desktop app links the
-          # windowing system, which a headless host does not have.
-          - runner: ubuntu-latest
+          # windowing system, which a headless host does not have. Runner
+          # images are pinned, both alike, so a release is not the first build
+          # on a new one; CI stays on ubuntu-latest to find out first.
+          - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             arch: amd64
           - runner: ubuntu-24.04-arm
@@ -73,10 +75,13 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      # The licenses travel with the binary. THIRD_PARTY_LICENSES.md is the
+      # committed one, which CI keeps in step with Cargo.lock.
       - name: Package
         run: |
           tar -czf "emailulator_${TAG#v}_linux_${{ matrix.arch }}.tar.gz" \
-            -C "target/${{ matrix.target }}/release" emailulator
+            -C "target/${{ matrix.target }}/release" emailulator \
+            -C "$GITHUB_WORKSPACE" LICENSE THIRD_PARTY_LICENSES.md
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -88,7 +93,7 @@ jobs:
   draft:
     name: Draft release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Download artifacts

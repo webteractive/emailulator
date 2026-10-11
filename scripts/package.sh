@@ -72,6 +72,10 @@ notarize() {
   echo "notarized ($NOTARY_ID)"
 }
 
+# The archive ships THIRD_PARTY_LICENSES.md; a stale one is found here, before
+# a build and a notarization, not after.
+./scripts/licenses.sh --check >/dev/null
+
 if [ "$MODE" = preflight ]; then
   preflight
   echo "signing ready: identity $SIGN_IDENTITY, notary profile '$NOTARY_PROFILE'"
@@ -141,7 +145,9 @@ fi
 # The archive is written last, from the exact file that was signed and checked.
 mkdir -p dist
 ARCHIVE="dist/emailulator_${VERSION}_darwin_arm64.tar.gz"
-tar -czf "$ARCHIVE" -C "$STAGE" emailulator
+# The licenses travel with the binary, as MIT and its dependencies ask.
+cp LICENSE THIRD_PARTY_LICENSES.md "$STAGE/"
+tar -czf "$ARCHIVE" -C "$STAGE" emailulator LICENSE THIRD_PARTY_LICENSES.md
 
 if [ "$MODE" = adhoc ]; then
   echo "Packaged $ARCHIVE ($("$BIN" --version)) — AD-HOC, not notarized: do not ship"

@@ -37,6 +37,23 @@ jobs:
         with:
           command: check bans licenses sources
 
+  # THIRD_PARTY_LICENSES.md ships in every release archive. It is generated
+  # offline from Cargo.lock, so it is deterministic too: a lockfile change that
+  # was not followed by scripts/licenses.sh fails here, not at release time.
+  notices:
+    name: Third-party notices
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install cargo-about
+        run: cargo install --locked cargo-about@0.9.2
+
+      - name: Check THIRD_PARTY_LICENSES.md
+        run: scripts/licenses.sh --check
+
   # Advisories depend on the outside world and can go red with no change to the
   # code. Kept as its own job so that never masks a real gate failure — require
   # `gates` for merge and treat this one as a signal to go and patch something.

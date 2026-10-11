@@ -6,13 +6,10 @@ Catch the email your application sends in development. Nothing is ever
 delivered: every message is stored and shown to you instead.
 
 - **In** over SMTP or an HTTP API.
-- **Out** through a web UI, a REST API, an MCP server for agents, and a
-  desktop app that shows the same web UI in a window of its own.
-- **Inboxes, one per app.** Each inbox has its own API keys. A key is what lets
-  an app deliver into the inbox, and what confines a reader — a script, an
-  agent — to it.
-- **One binary**, no runtime dependencies, SQLite inside. The same program is
-  the server (`emailulator run`) and the desktop app (`emailulator app`).
+- **Out** through a web UI, a REST API, an MCP server for agents, and a macOS
+  desktop app.
+- **One inbox per app**, each with its own API keys.
+- **One binary**, SQLite inside, no runtime dependencies.
 
 ```
 billing app ──SMTP as billing-app + key──▶ ┌─────────────┐ ──▶ web UI, desktop app
@@ -27,37 +24,23 @@ anything, no key, on this machine ───────▶ └──────
 curl -fsSL https://raw.githubusercontent.com/webteractive/emailulator/main/install.sh | sh
 ```
 
-That downloads the release for your platform, verifies its checksum, and puts
-`emailulator` in `~/.local/bin`. Set `EMAILULATOR_INSTALL_DIR` to put it
-elsewhere, or `EMAILULATOR_VERSION=0.1.0` to pin a release instead of taking the
-latest.
+It verifies the download's checksum and installs to `~/.local/bin`
+(`EMAILULATOR_INSTALL_DIR` to change it, `EMAILULATOR_VERSION=0.1.0` to pin a
+release).
 
 | Platform | What you get |
 | --- | --- |
-| macOS, Apple silicon | Server and desktop app, in the one binary; Developer ID signed and notarized |
-| Linux, x86-64 and arm64 | Server, statically linked: runs on any distro and in a bare container |
-
-From a checkout, `./install.sh --source` builds it with cargo instead.
+| macOS, Apple silicon | Server and desktop app; Developer ID signed and notarized |
+| Linux, x86-64 and arm64 | Server, statically linked |
 
 ## Run it
 
 ```sh
-emailulator run
+emailulator run      # SMTP on 127.0.0.1:1025, web UI, API and MCP on http://127.0.0.1:8025
+emailulator app      # or the desktop app, on a Mac
 ```
 
-```
-emailulator 0.1.0
-  SMTP   127.0.0.1:1025  (no auth; unauthenticated mail goes to the default inbox, no TLS)
-  HTTP   http://127.0.0.1:8025  (no auth)
-         web UI   http://127.0.0.1:8025/
-         API      http://127.0.0.1:8025/api/v1
-         MCP      http://127.0.0.1:8025/mcp
-```
-
-Or, on a Mac, skip the terminal: `emailulator app` opens the desktop app, which
-runs the same servers itself.
-
-Point your app at it and mail shows up in the `default` inbox. For Laravel:
+Point your app at it and mail lands in the `default` inbox. For Laravel:
 
 ```dotenv
 MAIL_MAILER=smtp
@@ -65,22 +48,16 @@ MAIL_HOST=127.0.0.1
 MAIL_PORT=1025
 ```
 
-In the web UI, `j`/`k` move between messages, `s` stars, `u` marks unread, `#`
-deletes and `/` searches. Drag the edge of the inbox sidebar or the message
-list to resize it, or focus the edge and use the arrow keys; a double-click
-restores the default. Widths are remembered in that browser.
+On this machine it needs no credentials. Mail is kept in the platform data
+directory, or in RAM with `--memory`. In the web UI, `j`/`k` move, `s` stars,
+`u` marks unread, `#` deletes and `/` searches.
 
-With no options it listens on this machine only and needs no credentials.
-Messages are kept in the platform data directory
-(`~/Library/Application Support/emailulator` on macOS,
-`~/.local/share/emailulator` on Linux); `--memory` keeps them in RAM instead.
+## Inboxes and keys
 
-## Inboxes and API keys
-
-Give each app its own inbox, so its mail is not mixed with another's:
+Give each app its own inbox:
 
 ```sh
-emailulator inbox create "Billing app" --description "Invoices and receipts"
+emailulator inbox create "Billing app"
 ```
 
 ```
@@ -89,161 +66,93 @@ Created inbox "Billing app" with the id billing-app.
 API key, shown this once:
 
   emu_3fa9c2d17b0e4c58a1d6f2e9b7c4a03d5e8f1a6b2c9d4e70
-
-SMTP   username  billing-app
-       password  the key
-API    Authorization: Bearer <the key>
 ```
 
-An inbox has a **name** for people and an **id** for machines. The id is made
-from the name when the inbox is created (`Billing app` becomes `billing-app`,
-or `billing-app-2` if that is taken) and then never changes, so renaming an
-inbox does not break the apps configured with it.
-
-The **id is the SMTP username and one of the inbox's keys is the password**:
+The **id is the SMTP username and a key is the password**:
 
 ```dotenv
-MAIL_MAILER=smtp
-MAIL_HOST=127.0.0.1
-MAIL_PORT=1025
 MAIL_USERNAME=billing-app
 MAIL_PASSWORD=emu_3fa9c2d1…
 ```
 
-A key works only with its own inbox's id; the same key under another id is
-refused. The same key, as a bearer token, reads and sends within that inbox over
-the API and MCP, and signs the web UI in to a view of that inbox alone.
+The same key, as `Authorization: Bearer`, reads and sends within that inbox
+over the API and MCP, and signs the web UI in to that inbox alone.
 
-- An inbox comes with its first key, and can have several, so one can be
-  replaced without downtime: `emailulator key create billing-app`, then
-  `emailulator key revoke <id>`.
-- `emailulator key regenerate <id>` replaces a key's value in place, keeping its
-  label. The old value stops working at once.
-- A key is shown once, when it is created or regenerated. Only a hash of it is
-  kept; `key list` shows its first characters and whether it has been used.
-- `default` always exists and cannot be deleted. It is where mail without a key
-  goes, which is what keeps a local setup working with nothing configured.
-- `default` also comes with a **starter key**, made the first time a store is
-  opened, so there is a key to hand an app without making one. It is the one
-  key kept readable: the Connect panel, `emailulator key list` and the admin
-  API show it in full. Regenerate it before an app outside this machine uses
-  it; the new value is an ordinary key, kept only as a hash and shown once. A
-  revoked starter key is not made again.
-- Deleting an inbox deletes its messages and keys.
+- The id never changes, so renaming an inbox breaks nothing.
+- An inbox can have several keys: `emailulator key create billing-app`, then
+  `key revoke <id>` to rotate without downtime. `key regenerate <id>` replaces a
+  value in place.
+- Keys are shown once and stored as hashes. The exception is `default`'s
+  **starter key**, kept readable so there is one to hand out; regenerate it
+  before an app on another machine uses it.
+- `inbox` and `key` act on the store on this machine. For a remote server, use
+  its web UI or the API with the admin token.
 
-`inbox` and `key` work on the message store on this machine, as the web UI and
-desktop app do; they take an inbox by id or by name, and every listing takes
-`--json`. Against a remote server, use its web UI or the API below with the
-admin token.
-
-## Sending without SMTP
+## Sending over HTTP
 
 ```sh
 curl -X POST http://127.0.0.1:8025/api/v1/messages \
   -H 'Authorization: Bearer emu_3fa9c2d1…' \
   -H 'Content-Type: application/json' \
-  -d '{
-    "from": "Shop <shop@example.test>",
-    "to": ["bob@example.test"],
-    "subject": "Your order shipped",
-    "text": "Plain body",
-    "html": "<p>Rich body</p>"
-  }'
+  -d '{"from": "Shop <shop@example.test>", "to": ["bob@example.test"],
+       "subject": "Your order shipped", "text": "Plain body", "html": "<p>Rich body</p>"}'
 ```
 
-The key decides the inbox. Without one (on an open local server) the message
-goes to `default`, or to `?inbox=<id>`.
-
-Also accepted: `cc`, `bcc`, `reply_to`, `headers` (an object), and `attachments`
-(`[{"filename", "content": "<base64>", "content_type"?, "content_id"?}]`).
-Addresses are `"a@b"`, `"Name <a@b>"` or `{"name", "address"}`.
-
-To deliver a complete RFC 5322 message, post it with any other content type;
-`?from=` and `?to=a@x,b@x` set the envelope, which otherwise comes from the
-message's own headers.
+Also accepted: `cc`, `bcc`, `reply_to`, `headers`, and `attachments`
+(`[{"filename", "content": "<base64>", "content_type"?}]`). Any other content
+type is taken as a raw RFC 5322 message, with `?from=` and `?to=` for the
+envelope.
 
 ## REST API
 
 A request acts as an **inbox key** (that inbox only) or as the **admin** (the
-admin token; or anyone, on a local server that has no token).
+admin token, or anyone on a local server without one).
 
 | Method and path | Does |
 | --- | --- |
-| `GET /api/v1/messages` | List, newest first; see the filters below |
-| `POST /api/v1/messages` | Deliver a message (above) |
-| `PATCH /api/v1/messages` | `{"read": true}` marks read everything the filters select |
-| `DELETE /api/v1/messages` | Delete everything the filters select |
+| `GET /api/v1/messages` | List, newest first, with filters |
+| `POST /api/v1/messages` | Deliver a message |
+| `PATCH`, `DELETE /api/v1/messages` | Mark read, or delete, everything the filters select |
 | `GET /api/v1/messages/{id}` | Headers, bodies, attachment list |
-| `PATCH /api/v1/messages/{id}` | `{"read": bool, "starred": bool}` |
-| `DELETE /api/v1/messages/{id}` | Delete one |
-| `GET /api/v1/messages/{id}/raw` | The message as received (`.eml`) |
-| `GET /api/v1/messages/{id}/html` | The HTML body, sandboxed, inline images embedded |
-| `GET /api/v1/messages/{id}/links` | Links with their anchor text |
-| `GET /api/v1/messages/{id}/check` | Which email clients support what the message uses; `?clients=outlook,gmail` narrows it |
+| `PATCH`, `DELETE /api/v1/messages/{id}` | `{"read", "starred"}`, or delete |
+| `GET /api/v1/messages/{id}/raw` · `/html` · `/links` · `/check` | The `.eml`, the sandboxed HTML, its links, the client check |
 | `GET /api/v1/messages/{id}/attachments/{index}` | One attachment |
-| `GET /api/v1/inboxes` | Inboxes with counts: all for the admin, its own for a key |
-| `POST /api/v1/inboxes` | *Admin.* `{"name", "description"?}` creates an inbox and returns it with its id and first key, once |
-| `PATCH /api/v1/inboxes/{id}` | *Admin.* `{"name"?, "description"?}`; the id does not change |
-| `DELETE /api/v1/inboxes/{id}` | *Admin.* Delete an inbox, its messages and keys |
-| `GET /api/v1/inboxes/{id}/keys` | *Admin.* Its keys, never the keys themselves |
-| `POST /api/v1/inboxes/{id}/keys` | *Admin.* `{"label"?}` creates a key and returns it, once |
-| `POST /api/v1/inboxes/{id}/keys/{key_id}/regenerate` | *Admin.* Replace a key's value and return the new one, once |
-| `DELETE /api/v1/inboxes/{id}/keys/{key_id}` | *Admin.* Revoke a key |
+| `GET /api/v1/inboxes` | Inboxes with counts |
+| `POST`, `PATCH`, `DELETE /api/v1/inboxes[/{id}]` | *Admin.* Manage inboxes |
+| `GET`, `POST /api/v1/inboxes/{id}/keys` | *Admin.* List keys, or create one |
+| `POST …/keys/{key_id}/regenerate`, `DELETE …/keys/{key_id}` | *Admin.* Replace or revoke a key |
 | `GET /api/v1/events` | Server-sent events as mail arrives and changes |
-| `GET /api/v1/info` | Version, ports, limits, counts, and who you are acting as |
-| `GET /healthz` | `ok` |
+| `GET /api/v1/info` · `GET /healthz` | Server details · `ok` |
 
-Filters, as query parameters: `inbox` (admin; a key is already confined), `to`
-(an exact recipient), `q`, `unread`, `starred`, `before`, `after`, `since`,
-`limit`. An unknown parameter is an error rather than ignored, so a misspelled
-filter cannot widen a bulk delete.
-
-Search (`q`) takes bare words plus `from:`, `to:`, `subject:`, `is:unread`,
-`is:read`, `is:starred` and `has:attachment`. Quote phrases:
-`subject:"reset link"`.
-
-A message in another inbox is, to a key, a message that does not exist: `404`,
-in the same words.
-
-`POST /api/v1/inboxes` with `"dry_run": true` creates nothing and answers with
-the id the name would get and a fresh key, for a form that shows both before the
-inbox exists; sending that `id` and `key` back creates the inbox with exactly
-those.
+Filters: `inbox` (admin), `to`, `q`, `unread`, `starred`, `before`, `after`,
+`since`, `limit`. An unknown filter is an error, so a typo cannot widen a bulk
+delete. `q` takes words plus `from:`, `to:`, `subject:`, `is:unread`, `is:read`,
+`is:starred`, `has:attachment` and `"quoted phrases"`.
 
 ## MCP
 
-Agents can read the mail their own actions caused. Give an agent an inbox's key
-and it works inside that inbox:
+Give an agent an inbox's key and it can read the mail its own actions caused:
 
 ```sh
 claude mcp add --transport http emailulator http://127.0.0.1:8025/mcp \
   --header "Authorization: Bearer emu_3fa9c2d1…"
 ```
 
-On an open local server the header can be left off, for access to every inbox.
-Or over stdio, reading the message store on this machine directly (no server
-needs to be running, though one must have caught the mail):
-
-```sh
-claude mcp add emailulator -- emailulator mcp --inbox billing-app   # id or name
-```
+Or over stdio, straight from the store on this machine:
+`claude mcp add emailulator -- emailulator mcp --inbox billing-app`.
 
 Tools: `list_messages`, `get_message`, `wait_for_message`, `get_links`,
 `check_message`, `get_attachment`, `get_raw_message`, `list_inboxes`,
-`mark_message`, `send_message`, `delete_messages`.
+`mark_message`, `send_message`, `delete_messages`. `wait_for_message` is for
+tests: trigger a sign-up, then wait for the mail by recipient and get its body
+and links in one call.
 
-`wait_for_message` is the one built for tests: trigger a sign-up or a password
-reset, then wait for the mail by recipient (`to`) and get its body and links
-back in a single call. It also matches mail that arrived in the last minute, so
-it is safe to call after the action.
+## Client check
 
-## Will it render? The client check
-
-No tool can show you exactly what Outlook or Gmail will do with an email:
-Outlook for Windows lays mail out with Word's engine, and Gmail rewrites the
-markup on its servers. What can be known from the message itself is which HTML
-and CSS features it uses and which clients support them, and that is the
-**Check** tab, in the web UI and the desktop app:
+The **Check** tab (and `check_message` for agents) lists the HTML and CSS a
+message uses and which email clients support it, from
+[caniemail.com](https://www.caniemail.com)'s data: about 300 features across 22
+clients.
 
 ```
 Gmail 20 of 24    Outlook 10 of 24    Apple Mail 24 of 24    Yahoo! Mail 17 of 24
@@ -253,110 +162,49 @@ Not supported (1)
     Outlook       not supported on Windows, Windows Mail
 ```
 
-- It reads the markup; it does not render it. Treat it as a list of things to
-  go and look at, not as a screenshot.
-- The data is [caniemail.com](https://www.caniemail.com)'s (MIT licensed),
-  bundled into the binary: about 300 features across 22 clients. The tab shows
-  the five most mail is read in, and every client on request. To refresh it:
-  `curl -o data/caniemail.json https://www.caniemail.com/api/data.json`.
-- A feature counts as unsupported for a client if it fails on any of that
-  client's platforms, since someone is reading there.
-- It also notes what is not about one feature: HTML over the 102 KB at which
-  Gmail clips a message, a missing plain-text part, images without alt text,
-  attachment types Gmail and Outlook refuse to deliver, and messages over the
-  main providers' size limits.
-- Contents of Outlook conditional comments (`<!--[if mso]>`) are not checked.
-
-For an agent it is the `check_message` tool: change a template, send it, check
-it, repeat.
+It reads the markup and does not render it, so treat it as a list of things to
+look at. It also flags HTML past Gmail's 102 KB clipping point, a missing
+plain-text part, images without alt text, and attachments Gmail or Outlook
+refuse. Outlook conditional comments are not checked.
 
 ## Desktop app
 
-```sh
-emailulator app
-```
-
-The web UI in a window of its own, with a Dock icon and a menu bar: everything
-the web UI does, the app does, because it is the same page. It is part of the
-`emailulator` binary on macOS, and the command returns as soon as the window is
-open (`--foreground` keeps it attached to the terminal). **Open in Browser**
-(⇧⌘O) opens the same server in your browser.
-
-The app runs the same SMTP and HTTP servers inside itself, on this machine only,
-and reads the same message store as `emailulator run`. If ports 1025 and 8025
-are taken — by another mail catcher, say — it uses 1026 and 8026 (then 2525 and
-8525) and shows which in the sidebar. `--smtp-addr`, `--http-addr` and
-`--data-dir` work as they do for `run`. If the app cannot start its servers at
-all, the window says why instead.
-
-The app is a local tool: it does not connect to a remote emailulator.
-
-The Linux release is the server alone, because a binary that links the windowing
-system cannot start on a headless host. There, `emailulator app` says so; use the
-web UI. To build the app into a binary yourself on any platform:
-`cargo build --release --features desktop`.
+`emailulator app` opens the web UI in a window of its own on macOS, running the
+same servers and store as `emailulator run`. If ports 1025 and 8025 are taken it
+moves to 1026 and 8026 (then 2525 and 8525) and shows which. It is a local tool:
+it does not connect to a remote server.
 
 ## Deploying
 
-Away from `127.0.0.1`, two things change:
+Away from `127.0.0.1`:
 
-- **HTTP needs an admin token**, or the server will not start:
-
-  ```
-  error: the HTTP listener on 0.0.0.0:8025 is reachable from other machines but
-  has no auth token, so anyone who can reach it could read every captured email.
-  ```
-
-- **SMTP needs an inbox id and key** from every client. There is no anonymous
-  mail, so there is nothing to send until an inbox has a key.
+- **HTTP needs an admin token**, or the server refuses to start.
+- **SMTP needs an inbox id and key** from every client.
 
 ```sh
-export EMAILULATOR_AUTH_TOKEN=$(openssl rand -hex 32)                 # admin
-export EMAILULATOR_PROVISION=billing-app=$(openssl rand -hex 32)      # inbox=key
+export EMAILULATOR_AUTH_TOKEN=$(openssl rand -hex 32)              # admin
+export EMAILULATOR_PROVISION=billing-app=$(openssl rand -hex 32)   # inbox=key, comma-separated
 docker compose up -d
 ```
 
-`EMAILULATOR_PROVISION` makes inbox keys valid at startup — `inbox-id=key` pairs
-separated by commas, each inbox created if missing and named after its id — so a deployment can hand an
-app its key through configuration instead of minting one by hand. Keys can also
-be created afterwards in the web UI, signed in with the admin token.
+`EMAILULATOR_PROVISION` makes inbox keys valid at startup, creating the inboxes,
+so an app can get its key from configuration. `compose.yaml` runs a distroless
+image as an unprivileged user on a read-only filesystem, with both ports on the
+host's loopback. Without Docker, run `emailulator run` under your service
+manager with the same variables.
 
-`compose.yaml` runs it as an unprivileged user on a read-only root filesystem
-with all capabilities dropped, data on a volume, and both ports published on the
-host's loopback. The image is distroless: no shell, no package manager.
+**TLS.** Terminate it at a reverse proxy, or pass `--tls-cert` and `--tls-key`,
+which turns on HTTPS and SMTP `STARTTLS` together. A proxy covers HTTP only, so
+SMTP from other machines still needs the certificate.
 
-To run it without Docker, install it with the one-liner above and start
-`emailulator run` under whatever supervises your services, with the same
-variables set.
-
-For anything reachable over a network, add TLS. Either terminate it at a reverse
-proxy in front of port 8025, or give emailulator a certificate, which turns on
-HTTPS and SMTP `STARTTLS` together:
+**Behind a proxy on the same machine** (Laravel Forge, for instance) the server
+listens on loopback, where no token is required. Set one anyway, with
+`EMAILULATOR_REQUIRE_AUTH_TOKEN=1` so it will not start without it: a proxy that
+does not pass `Host` through would otherwise expose every captured email.
 
 ```sh
-emailulator run --tls-cert fullchain.pem --tls-key privkey.pem
+EMAILULATOR_REQUIRE_AUTH_TOKEN=1 EMAILULATOR_AUTH_TOKEN_FILE=/home/emailulator/token emailulator run
 ```
-
-A proxy should pass the original host through, as `Host` or `X-Forwarded-Host`,
-and set `X-Forwarded-Proto: https`: the first is how the server tells its own
-web UI from another site, the second is what marks the session cookie `Secure`.
-A proxy only covers HTTP, so SMTP still needs the certificate to be encrypted.
-
-**Behind a proxy on the same machine, set the admin token anyway.** The server
-listens on `127.0.0.1` there, and a loopback listener needs no token, so nothing
-stops it starting without one. Without a token the only guard left is the
-`Host` check, and a proxy that does not pass the original host through sends
-`Host: 127.0.0.1:8025`, which passes it: every captured email is then open to
-whoever reaches the proxy. Set `EMAILULATOR_REQUIRE_AUTH_TOKEN=1` beside the
-token, and the server refuses to start if the token is ever missing:
-
-```sh
-EMAILULATOR_REQUIRE_AUTH_TOKEN=1 \
-EMAILULATOR_AUTH_TOKEN_FILE=/home/emailulator/token \
-emailulator run
-```
-
-For nginx, for instance on Laravel Forge:
 
 ```nginx
 location / {
@@ -372,7 +220,8 @@ location / {
 
 ### Options
 
-Every flag has an environment variable; `emailulator run --help` lists them all.
+Every flag has an environment variable; `emailulator run --help` lists them.
+On/off variables take `1`/`0`, `true`/`false`, `yes`/`no` or `on`/`off`.
 
 | Variable | Default | |
 | --- | --- | --- |
@@ -387,110 +236,49 @@ Every flag has an environment variable; `emailulator run --help` lists them all.
 | `EMAILULATOR_ALLOW_ANONYMOUS_HTTP` | off | Serve an exposed HTTP listener with no token |
 | `EMAILULATOR_ALLOW_ANONYMOUS_SMTP` | off | Accept keyless SMTP on an exposed listener, into `default` |
 | `EMAILULATOR_MAX_MESSAGE_SIZE` | `25MB` | Largest message accepted |
-| `EMAILULATOR_MAX_MESSAGES` | `1000` | Oldest are dropped beyond this, across all inboxes; `0` keeps all |
-| `EMAILULATOR_MAX_STORAGE` | `1GB` | Oldest are dropped beyond this; `0` for no cap |
+| `EMAILULATOR_MAX_MESSAGES` | `1000` | Oldest dropped beyond this, across all inboxes; `0` keeps all |
+| `EMAILULATOR_MAX_STORAGE` | `1GB` | Oldest dropped beyond this; `0` for no cap |
 | `EMAILULATOR_NO_UI` | off | API and MCP only |
 
-Prefer the environment or the `_FILE` variant for secrets: a command-line
-argument is visible to every user of the machine in the process list.
+Pass secrets through the environment or a `_FILE`, not a flag: arguments are
+visible to every user in the process list.
 
 ## Security model
 
-Captured mail is sensitive — it is where password-reset links go — and email
-content is written by whoever sends it. The design assumes both.
+Captured mail holds password-reset links, and its content is written by
+whoever sends it. The design assumes both.
 
-**Who gets in**
+- **No silent open mode.** An exposed listener needs credentials, or an
+  `--allow-anonymous-*` flag that says so.
+- **Two credentials.** The admin token reaches everything. An inbox key reaches
+  one inbox's messages and nothing else, not even which other inboxes exist.
+- **Keys are hashed** and shown once; only the starter key is kept readable.
+  Revoking or regenerating a key ends the browser sessions, event streams and
+  MCP calls using it, including when done from the command line.
+- **Sessions** are a random id in an `HttpOnly; SameSite=Strict` cookie,
+  `Secure` over HTTPS; the credential never reaches the browser. They end on
+  sign-out, after seven days, or on restart.
+- **Guessing is slowed.** The admin token is compared in constant time, failed
+  sign-ins are delayed, and three bad SMTP logins close the connection. With
+  TLS, SMTP accepts `AUTH` only after `STARTTLS`.
+- **Browsers are kept out.** Without a token, only `localhost` names are served,
+  which stops DNS rebinding; state-changing requests from other origins are
+  refused.
+- **Email content is contained.** HTML bodies are sandboxed with no scripts,
+  attachments are always downloads, and the UI renders text nodes only under a
+  strict CSP. Remote images do load when you open a message, as in a mail
+  client.
+- **It never relays**, and size, recipients, connections, message count and
+  storage are all capped.
 
-- A listener on a non-loopback address needs credentials, or an explicit
-  `--allow-anonymous-*` flag. There is no silent open mode.
-- There are two kinds of credential. The **admin token** reaches every inbox and
-  manages inboxes and keys. An **inbox API key** reaches the messages of one
-  inbox and nothing else: not other inboxes, not their existence, not key
-  management.
-- Keys are stored as SHA-256 hashes and shown once. The exception is the default
-  inbox's starter key, which is also kept readable in the database until it is
-  regenerated, so anyone who can read that file can read it. Revoking or
-  regenerating a key, from the API or the command line, also ends the browser
-  sessions opened with it at their next request, and the live event streams and
-  MCP calls using it: at once when it is done through the API, within a second
-  or so from the command line, which cannot reach the server. Sessions opened
-  with the inbox's other keys go on.
-- The web UI signs in with either credential and gets a random session id in an
-  `HttpOnly; SameSite=Strict` cookie (`Secure` over HTTPS); the credential
-  itself is never stored in the browser. Sessions end on sign-out, after seven
-  days, or when the server restarts.
-- The admin token is compared in constant time. Failed sign-ins and SMTP logins
-  are delayed; three bad SMTP logins close the connection. A credential that is
-  presented and wrong is refused even on a server that needs none, so a revoked
-  key fails loudly.
-- With TLS configured, SMTP offers and accepts `AUTH` only after `STARTTLS`
-  (clients on the same machine excepted). Anything a client sends in the clear
-  after `STARTTLS` drops the connection rather than being read as if it were
-  encrypted.
-- With no token on a loopback listener, requests must be addressed to
-  `localhost` or a loopback IP, which stops a web page from reaching the server
-  through DNS rebinding. State-changing requests from another origin are refused.
-- The server will not start on a port something else already answers on, rather
-  than bind beside it and take its traffic.
-
-**What email content can do**
-
-- HTML bodies are served with `Content-Security-Policy: sandbox` and no script
-  source, and framed with a matching `sandbox` attribute: scripts do not run and
-  the document cannot reach the API or the session.
-- Attachments are always downloads, also sandboxed, with `nosniff`.
-- The web UI builds the page from text nodes only and runs under
-  `default-src 'self'`, with no inline script or style.
-- The desktop app's webview may load only the app's own server, in the page and
-  in the frame an email is shown in, and opens a link in your browser only when
-  you click it. Saved attachments and messages are written to Downloads and
-  never overwrite a file.
-- Remote images in an email **are** loaded when you view it, as a mail client
-  would, so the sender's server learns that you did.
-
-**What it will not do**
-
-- Relay. There is no code path that sends mail anywhere.
-- Fill the disk. Message size, recipients per message, concurrent SMTP
-  connections, message count and total stored bytes are all capped.
-
-The database file is created `0600` in a `0700` directory. It is not encrypted
-at rest.
+The database is created `0600` in a `0700` directory, unencrypted.
 
 ## Development
 
-```sh
-cargo test                           # the server
-cargo test --features desktop        # plus the desktop app's own tests
-cargo run --features desktop -- app  # the desktop app from source
-cargo deny check                     # licenses, sources, advisories, banned crates
-```
+Building from source, tests and releasing: [DEVELOPMENT.md](DEVELOPMENT.md).
 
-In a debug build the web UI is read from `ui/` on every request, so editing it
-needs no rebuild. It is plain HTML, CSS and one ES module: no build step.
+## License
 
-The desktop app can test itself against a real window: set
-`EMAILULATOR_APP_SELFTEST=1` and run `emailulator app --foreground` with a
-scratch `--data-dir`. It delivers a message through its own API, waits for the
-web UI in the window to show it, and exits non-zero if it does not within 30
-seconds.
-
-## Releasing
-
-```sh
-scripts/release.sh patch      # or minor, major, X.Y.Z, or `current` for no bump
-```
-
-A release is assembled from two places, and the script drives both:
-
-- **macOS** is built on a Mac by `scripts/package.sh`: Developer ID signed with
-  the hardened runtime, self-tested, and notarized. It needs the "Developer ID
-  Application" certificate in the keychain and a notarytool keychain profile
-  named `notary`; `scripts/package.sh --preflight` checks for both, and the
-  release script runs that before it changes anything.
-- **Linux** is built by the release workflow when the tag is pushed. It leaves
-  its archives on a draft release.
-
-The script then adds the macOS archive and a `checksums.txt` covering all three
-archives, and publishes. Until that last step the release is a draft, which
-`install.sh` cannot see, so a half-assembled release is never installable.
+[MIT](LICENSE), © Webteractive. The bundled client-support data is
+[caniemail.com](https://www.caniemail.com)'s, also MIT
+([data/caniemail.LICENSE](data/caniemail.LICENSE)).

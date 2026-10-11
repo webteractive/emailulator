@@ -4,6 +4,8 @@ description = "A development email catcher: SMTP and HTTP in, web UI, API, MCP a
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/webteractive/emailulator"
 publish = false
 
 [features]

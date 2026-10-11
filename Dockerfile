@@ -1,7 +1,10 @@
 # syntax=docker/dockerfile:1
 
 # The server-only build: no `desktop` feature, so nothing here needs a display.
-FROM rust:1.92-slim-bookworm AS build
+# The Rust version matches rust-toolchain.toml; change them together. Bookworm
+# matches the distroless runtime below (Debian 12), whose glibc the binary
+# links: built on a newer Debian, it would ask for a glibc the runtime lacks.
+FROM rust:1.99.0-slim-bookworm AS build
 WORKDIR /src
 
 COPY Cargo.toml Cargo.lock build.rs ./

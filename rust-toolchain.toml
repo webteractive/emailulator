@@ -1,0 +1,9 @@
+# The Rust every build uses: this machine, CI, the release workflow's Linux
+# archives and the macOS archive scripts/package.sh signs. Without it each took
+# whatever was installed, so one release could ship three compilers' output and
+# a newer clippy on CI failed code the local one passed. Upgrade on purpose:
+# change this and the Dockerfile's base image together, and let CI check it.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

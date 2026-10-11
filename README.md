@@ -33,6 +33,21 @@ release).
 | macOS, Apple silicon | Server and desktop app; Developer ID signed and notarized |
 | Linux, x86-64 and arm64 | Server, statically linked |
 
+### Updating
+
+`emailulator self-update` installs the latest release when it is newer, after
+checking that the release's checksums are signed with the emailulator release
+key and that the download matches them; `--check` only reports. On a server,
+run it daily from cron as the user that runs the server, with `--restart` so
+its supervisor (a Forge daemon, systemd) starts it on the new binary:
+
+```
+0 4 * * * /home/emailulator/.local/bin/emailulator self-update --restart
+```
+
+A restart signs everyone out of the web UI. Self-update arrived in 0.1.1, so
+0.1.0 is updated once by hand, with the install command above.
+
 ## Run it
 
 ```sh
@@ -195,7 +210,9 @@ manager with the same variables.
 
 **TLS.** Terminate it at a reverse proxy, or pass `--tls-cert` and `--tls-key`,
 which turns on HTTPS and SMTP `STARTTLS` together. A proxy covers HTTP only, so
-SMTP from other machines still needs the certificate.
+SMTP from other machines still needs the certificate, and a host name of its
+own: set `EMAILULATOR_SMTP_HOST` to it so the web UI's connection details point
+apps there rather than at the proxied name.
 
 **Behind a proxy on the same machine** (Laravel Forge, for instance) the server
 listens on loopback, where no token is required. Set one anyway, with
@@ -227,6 +244,7 @@ On/off variables take `1`/`0`, `true`/`false`, `yes`/`no` or `on`/`off`.
 | --- | --- | --- |
 | `EMAILULATOR_SMTP_ADDR` | `127.0.0.1:1025` | SMTP listener |
 | `EMAILULATOR_HTTP_ADDR` | `127.0.0.1:8025` | Web UI, API and MCP |
+| `EMAILULATOR_SMTP_HOST` | the SMTP listener's address | The SMTP host the web UI tells apps to use |
 | `EMAILULATOR_DATA_DIR` | platform data dir | Where the database lives |
 | `EMAILULATOR_MEMORY` | off | Keep messages in memory only |
 | `EMAILULATOR_AUTH_TOKEN` / `_FILE` | none | The admin token (16+ characters) |

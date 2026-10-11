@@ -65,6 +65,27 @@ enum Command {
     Healthcheck(HealthArgs),
     /// Print the version
     Version,
+    /// Replace this binary with the latest release, if that is newer
+    #[command(
+        long_about = "Replace this binary with the latest release, if that is newer.\n\n\
+            The release's checksums must carry the release key's signature, made for that \
+            release, and the archive must match them; anything else is refused and nothing is \
+            replaced. It never moves to an older version. A running server keeps the binary it \
+            started with until it restarts: --restart asks this user's `emailulator run` to stop, \
+            for whatever supervises it to start again. To run it daily from cron:\n\n  \
+            emailulator self-update --restart"
+    )]
+    SelfUpdate(SelfUpdateArgs),
+}
+
+#[derive(Args)]
+struct SelfUpdateArgs {
+    /// Only say whether a newer release exists
+    #[arg(long, conflicts_with = "restart")]
+    check: bool,
+    /// After updating, stop this user's running `emailulator run` so its supervisor starts the new binary
+    #[arg(long)]
+    restart: bool,
 }
 
 #[derive(Subcommand)]
@@ -268,6 +289,13 @@ struct RunArgs {
     #[arg(long, env = "EMAILULATOR_ALLOW_ANONYMOUS_SMTP", value_parser = BoolishValueParser::new())]
     allow_anonymous_smtp: bool,
 
+    /// The host applications reach SMTP by, shown in the web UI's connection
+    /// details. Defaults to the SMTP listener's address; set it when that
+    /// listens on every interface, or when the web UI's own host name reaches
+    /// only HTTP, as behind Cloudflare's proxy
+    #[arg(long, env = "EMAILULATOR_SMTP_HOST", value_name = "HOST", value_parser = parse_host)]
+    smtp_host: Option<String>,
+
     /// PEM certificate chain; with --tls-key, enables HTTPS and SMTP STARTTLS
     #[arg(
         long,
@@ -324,6 +352,18 @@ fn parse_provision(value: &str) -> Result<(String, String), String> {
         }
         _ => Err(format!("`{value}` is not an inbox=key pair")),
     }
+}
+
+/// A bare host name or address: the UI puts it in MAIL_HOST as it is, so a
+/// scheme, path or space would be copied into every app's configuration.
+fn parse_host(value: &str) -> Result<String, String> {
+    let host = value.trim();
+    if host.is_empty() || host.contains(|c: char| c.is_whitespace() || c == '/') {
+        return Err(format!(
+            "`{value}` is not a host name; give one such as smtp.example.com"
+        ));
+    }
+    Ok(host.to_string())
 }
 
 /// Parse a byte count with an optional KB, MB or GB suffix.
@@ -396,6 +436,7 @@ impl RunArgs {
             allow_anonymous_http: self.allow_anonymous_http,
             require_auth_token: self.require_auth_token,
             allow_anonymous_smtp: self.allow_anonymous_smtp,
+            smtp_host: self.smtp_host,
             tls: self
                 .tls_cert
                 .zip(self.tls_key)
@@ -802,7 +843,37 @@ async fn run(command: Command) -> Result<()> {
             println!("emailulator {VERSION}");
             Ok(())
         }
+        Command::SelfUpdate(args) => self_update(args),
     }
+}
+
+fn self_update(args: SelfUpdateArgs) -> Result<()> {
+    use emailulator::update::{self, Outcome, Source, Version};
+
+    // Points at a local copy of the releases, for testing an update end to
+    // end. The signature is still checked against the built-in release key.
+    let source = match std::env::var("EMAILULATOR_UPDATE_SOURCE") {
+        Ok(base) if !base.trim().is_empty() => Source::at(base.trim()),
+        _ => Source::github(),
+    };
+    let current = Version::parse(env!("CARGO_PKG_VERSION"))?;
+    match update::update(&source, current, args.check)? {
+        Outcome::Current(version) => println!("emailulator {version} is up to date"),
+        Outcome::Available { current, latest } => {
+            println!("emailulator {latest} is available; this is {current}");
+        }
+        Outcome::Updated { from, to, path } => {
+            println!("updated {} from {from} to {to}", path.display());
+            if args.restart {
+                if update::restart_servers()? {
+                    println!("asked the running server to stop, for its supervisor to restart it");
+                } else {
+                    println!("no running server to restart");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {

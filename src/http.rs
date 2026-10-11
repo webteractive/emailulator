@@ -61,6 +61,11 @@ struct Assets;
 pub struct ServerInfo {
     pub name: &'static str,
     pub version: &'static str,
+    /// The host applications reach SMTP by, as the web UI tells them: the one
+    /// configured, or the listener's own address. `None` when it listens on
+    /// every interface and nothing was configured, leaving the UI to use the
+    /// host it was loaded from.
+    pub smtp_host: Option<String>,
     pub smtp_port: u16,
     pub smtp_starttls: bool,
     /// Whether SMTP clients must authenticate with an inbox id and API key.
@@ -1416,6 +1421,7 @@ mod tests {
             info: ServerInfo {
                 name: "emailulator",
                 version: "test",
+                smtp_host: Some("127.0.0.1".into()),
                 smtp_port: 1025,
                 smtp_starttls: false,
                 smtp_auth_required: false,

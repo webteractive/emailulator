@@ -13,6 +13,7 @@ pub mod parse;
 pub mod security;
 pub mod smtp;
 pub mod store;
+pub mod update;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -68,6 +69,10 @@ pub struct Config {
     /// Let an SMTP listener that is reachable from other machines accept mail
     /// from clients that do not authenticate with an inbox key.
     pub allow_anonymous_smtp: bool,
+    /// The host the web UI tells applications to reach SMTP by. Behind a proxy
+    /// the page's own host may carry only HTTP, so a deployment names the one
+    /// that reaches the SMTP listener.
+    pub smtp_host: Option<String>,
     /// Enables HTTPS and SMTP STARTTLS.
     pub tls: Option<TlsFiles>,
     pub ui: bool,
@@ -86,6 +91,7 @@ impl Default for Config {
             allow_anonymous_http: false,
             require_auth_token: false,
             allow_anonymous_smtp: false,
+            smtp_host: None,
             tls: None,
             ui: true,
         }
@@ -99,6 +105,18 @@ impl Config {
     /// outright that the network is trusted.
     pub fn smtp_requires_auth(&self) -> bool {
         !self.smtp_addr.ip().is_loopback() && !self.allow_anonymous_smtp
+    }
+
+    /// The host the web UI gives applications for SMTP: the one configured,
+    /// or else the listener's address. A listener on every interface has no
+    /// one address to give, and the UI falls back to the host it was loaded
+    /// from.
+    pub fn advertised_smtp_host(&self) -> Option<String> {
+        if let Some(host) = &self.smtp_host {
+            return Some(host.clone());
+        }
+        let ip = self.smtp_addr.ip();
+        (!ip.is_unspecified()).then(|| ip.to_string())
     }
 
     /// Refuse a configuration that would expose captured mail to a network,
@@ -233,6 +251,7 @@ impl Emailulator {
         let info = ServerInfo {
             name: "emailulator",
             version: env!("CARGO_PKG_VERSION"),
+            smtp_host: config.advertised_smtp_host(),
             smtp_port: smtp.local_addr()?.port(),
             smtp_starttls: smtp_tls.is_some(),
             smtp_auth_required,
@@ -354,6 +373,27 @@ mod tests {
             warnings.len(),
             3,
             "open HTTP, open SMTP, no STARTTLS: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn the_smtp_host_shown_is_the_configured_one_or_the_listeners() {
+        let local = Config {
+            data_dir: None,
+            ..Config::default()
+        };
+        assert_eq!(local.advertised_smtp_host().as_deref(), Some("127.0.0.1"));
+
+        let mut everywhere = exposed();
+        assert_eq!(
+            everywhere.advertised_smtp_host(),
+            None,
+            "every interface leaves it to the page's host"
+        );
+        everywhere.smtp_host = Some("smtp.example.test".into());
+        assert_eq!(
+            everywhere.advertised_smtp_host().as_deref(),
+            Some("smtp.example.test")
         );
     }
 

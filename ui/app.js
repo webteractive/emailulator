@@ -316,7 +316,9 @@ function applyRoute(force = false) {
     loadDetail(route.id);
   }
   if (route.panel && panelChanged) loadKeys();
-  if (panelChanged) {
+  // The welcome is drawn for one view, so a new view needs it drawn again:
+  // the Connect button it offers belongs to the inbox being looked at.
+  if (panelChanged || viewChanged) {
     renderListHead();
     renderEmptiness();
   }
@@ -917,8 +919,18 @@ function renderSidebar() {
   $('nav-empty').hidden = !state.inboxesLoaded || shown.length > 0;
 }
 
+/**
+ * Where an app reaches SMTP: the host the server names, which is its listener's
+ * address or the one an operator set. Only a server listening on every
+ * interface leaves it to the page's own host, which behind a proxy can be a
+ * name that only carries HTTP.
+ */
 function smtpEndpoint() {
-  return { host: location.hostname, port: state.info ? state.info.smtp_port : 1025 };
+  const info = state.info;
+  return {
+    host: (info && info.smtp_host) || location.hostname,
+    port: info ? info.smtp_port : 1025,
+  };
 }
 
 /** The sidebar footer: where this server listens and who you are to it. */

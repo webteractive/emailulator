@@ -1,7 +1,11 @@
 target
 .git
 .github
-data
+# A local message store may sit in data/; the client-check data the binary is
+# built with must not be left out with it.
+data/*
+!data/caniemail.json
+!data/caniemail.LICENSE
 *.db
 *.db-shm
 *.db-wal

@@ -5,7 +5,7 @@ following open-source crates, under the licenses below, and the client-support
 data from caniemail.com, at the end.
 
 - Apache License 2.0 (165)
-- MIT License (80)
+- MIT License (81)
 - Unicode License v3 (19)
 - ISC License (18)
 - BSD 3-Clause "New" or "Revised" License (2)
@@ -7091,6 +7091,7 @@ Used by:
 - dlopen2 0.8.2
 - dlopen2_derive 0.4.3
 - dpi 0.1.2
+- minisign-verify 0.2.5
 - objc2-encode 4.1.0
 - objc2-foundation 0.3.2
 - objc2 0.6.5

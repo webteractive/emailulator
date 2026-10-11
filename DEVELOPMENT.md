@@ -67,6 +67,28 @@ It is generated offline from `Cargo.lock` with `about.toml` and `about.hbs`, so
 it is reproducible. CI fails when it is out of date, and so does
 `scripts/package.sh` before it builds anything.
 
+## Release signing and self-update
+
+Every release's `checksums.txt` is signed with minisign, and
+`emailulator self-update` installs nothing without that signature. The public
+key is `minisign.pub`, built into the binary; the secret key is
+`~/.minisign/emailulator.key` (or `EMAILULATOR_MINISIGN_KEY`) on the machine
+that cuts releases, `0600` and without a password so `release.sh` can sign
+unattended. `release.sh` checks it against `minisign.pub` before it changes
+anything, signs with the tag as the trusted comment (`emailulator vX.Y.Z`), and
+uploads `checksums.txt.minisig`; self-update refuses a signature made for any
+other version, so an old signed release cannot be passed off as a new one.
+
+To rotate the key: `minisign -G -W -p minisign.pub -s ~/.minisign/emailulator.key -f`,
+commit `minisign.pub`, and release. A binary trusts only the key it was built
+with, so servers on the old key refuse that release: update each of them once
+by hand with `install.sh`, and self-update carries on from there.
+
+To try an update end to end without GitHub, lay out a release as
+`<dir>/latest` (`{"tag_name": "vX.Y.Z"}`) and `<dir>/download/vX.Y.Z/<files>`,
+serve it, and run `EMAILULATOR_UPDATE_SOURCE=http://127.0.0.1:<port> emailulator self-update`.
+The signature is still checked against the built-in key.
+
 ## Releasing
 
 ```sh

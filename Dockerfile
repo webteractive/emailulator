@@ -7,7 +7,8 @@
 FROM rust:1.99.0-slim-bookworm AS build
 WORKDIR /src
 
-COPY Cargo.toml Cargo.lock build.rs ./
+# minisign.pub is the release key self-update checks, built into the binary.
+COPY Cargo.toml Cargo.lock build.rs minisign.pub ./
 COPY src ./src
 COPY ui ./ui
 COPY data ./data

@@ -74,6 +74,22 @@ current_branch=$(git rev-parse --abbrev-ref HEAD)
 # leave a release commit with nothing to release.
 ./scripts/package.sh --preflight >/dev/null || die "signing is not ready — see scripts/package.sh --preflight"
 
+# checksums.txt is signed with the release key, and self-update installs
+# nothing without that signature. Check the key here, against the public half
+# the binary is built with, so a missing or mismatched key stops the release
+# before anything is pushed.
+MINISIGN_KEY=${EMAILULATOR_MINISIGN_KEY:-$HOME/.minisign/emailulator.key}
+command -v minisign >/dev/null 2>&1 || die "minisign is required: brew install minisign"
+[ -r "$MINISIGN_KEY" ] || die "the release signing key is missing: $MINISIGN_KEY — see DEVELOPMENT.md"
+probe=$(mktemp)
+echo probe > "$probe"
+if ! { minisign -S -s "$MINISIGN_KEY" -m "$probe" -x "$probe.minisig" -t probe >/dev/null 2>&1 \
+  && minisign -V -q -p minisign.pub -m "$probe" -x "$probe.minisig" >/dev/null 2>&1; }; then
+  rm -f "$probe" "$probe.minisig"
+  die "$MINISIGN_KEY cannot sign, or does not match minisign.pub"
+fi
+rm -f "$probe" "$probe.minisig"
+
 git fetch --quiet "$REMOTE" "$BRANCH"
 if [ -n "$(git rev-list "HEAD..$REMOTE/$BRANCH")" ]; then
   die "behind $REMOTE/$BRANCH — pull first"
@@ -181,7 +197,14 @@ count=$(find "$WORK" -name 'emailulator_*.tar.gz' | wc -l | tr -d ' ')
 
 # One checksums.txt over everything, written last: it is what install.sh trusts.
 (cd "$WORK" && shasum -a 256 emailulator_*.tar.gz > checksums.txt)
-gh release upload "$TAG" "$WORK/$(basename "$MAC_ARCHIVE")" "$WORK/checksums.txt" --clobber
+# Signed for this tag: self-update checks the key, and that the signed trusted
+# comment names the release it is installing.
+minisign -S -s "$MINISIGN_KEY" -m "$WORK/checksums.txt" -t "emailulator $TAG" >/dev/null \
+  || die "signing checksums.txt failed — the draft release is left as it is"
+minisign -V -q -p minisign.pub -m "$WORK/checksums.txt" >/dev/null \
+  || die "checksums.txt.minisig does not verify against minisign.pub"
+gh release upload "$TAG" "$WORK/$(basename "$MAC_ARCHIVE")" \
+  "$WORK/checksums.txt" "$WORK/checksums.txt.minisig" --clobber
 if [ -n "$NOTES" ]; then
   gh release edit "$TAG" --notes-file "$NOTES"
 fi

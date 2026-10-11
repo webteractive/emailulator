@@ -99,12 +99,53 @@ impl Access {
     }
 }
 
+/// An inbox's API key as something that outlives one request holds it: by
+/// its hash, never the key itself, with the inbox it opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxKey {
+    pub inbox: String,
+    pub hash: String,
+}
+
+/// A browser session. One opened with an inbox's API key keeps that key's
+/// hash, and the key is checked again on every request, so the session ends
+/// with its key however the key was revoked or replaced, including from the
+/// command line, which cannot reach this process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Session {
+    Admin,
+    Inbox(InboxKey),
+}
+
+impl Session {
+    pub fn access(&self) -> Access {
+        match self {
+            Session::Admin => Access::Admin,
+            Session::Inbox(key) => Access::Inbox(key.inbox.clone()),
+        }
+    }
+}
+
+/// How a caller identified itself, kept so that a request which outlives its
+/// own authorization, such as an event stream or a long tool call, can check
+/// that the caller still may. Checking it reads; it never records a use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Credential {
+    /// Nothing that can be withdrawn while the server runs: no credential on a
+    /// server that asks for none, or the admin token.
+    Standing,
+    /// An inbox's API key, presented with the request.
+    Key(InboxKey),
+    /// A browser session, by its id.
+    Session(String),
+}
+
 /// Access control for the HTTP side: the admin token, and the browser sessions
 /// opened by presenting it or an inbox's API key.
 pub struct Auth {
     token: Option<String>,
     comparer: SecretComparer,
-    sessions: Mutex<HashMap<String, (Instant, Access)>>,
+    sessions: Mutex<HashMap<String, (Instant, Session)>>,
 }
 
 impl Auth {
@@ -138,9 +179,8 @@ impl Auth {
             .is_some_and(|token| self.comparer.eq(candidate.as_bytes(), token.as_bytes()))
     }
 
-    /// Open a browser session with the given access and return its id, the
-    /// cookie value.
-    pub fn open_session(&self, access: Access) -> String {
+    /// Open a browser session and return its id, the cookie value.
+    pub fn open_session(&self, session: Session) -> String {
         let id = hex(&random_bytes::<32>());
         let now = Instant::now();
         let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
@@ -155,16 +195,16 @@ impl Auth {
                 sessions.remove(&oldest);
             }
         }
-        sessions.insert(id.clone(), (now + SESSION_TTL, access));
+        sessions.insert(id.clone(), (now + SESSION_TTL, session));
         id
     }
 
-    pub fn session(&self, id: &str) -> Option<Access> {
+    pub fn session(&self, id: &str) -> Option<Session> {
         let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         sessions
             .get(id)
             .filter(|(expires, _)| *expires > Instant::now())
-            .map(|(_, access)| access.clone())
+            .map(|(_, session)| session.clone())
     }
 
     pub fn close_session(&self, id: &str) {
@@ -179,7 +219,7 @@ impl Auth {
         self.sessions
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .retain(|_, (_, access)| access.inbox() != Some(inbox));
+            .retain(|_, (_, session)| session.access().inbox() != Some(inbox));
     }
 
     pub fn session_ttl(&self) -> Duration {
@@ -269,10 +309,15 @@ mod tests {
     #[test]
     fn sessions_carry_their_access_and_close() {
         let auth = Auth::new(Some(generate_token())).unwrap();
-        let admin = auth.open_session(Access::Admin);
-        let scoped = auth.open_session(Access::Inbox("billing".into()));
-        assert_eq!(auth.session(&admin), Some(Access::Admin));
-        assert_eq!(auth.session(&scoped), Some(Access::Inbox("billing".into())));
+        let as_admin = Session::Admin;
+        let as_billing = Session::Inbox(InboxKey {
+            inbox: "billing".into(),
+            hash: hash_api_key("emu_billing"),
+        });
+        let admin = auth.open_session(as_admin.clone());
+        let scoped = auth.open_session(as_billing.clone());
+        assert_eq!(auth.session(&admin), Some(as_admin.clone()));
+        assert_eq!(auth.session(&scoped), Some(as_billing));
         assert_eq!(auth.session("not-a-session"), None);
 
         auth.close_inbox_sessions("billing");
@@ -281,7 +326,7 @@ mod tests {
             None,
             "revoking a key ends its sessions"
         );
-        assert_eq!(auth.session(&admin), Some(Access::Admin));
+        assert_eq!(auth.session(&admin), Some(as_admin));
         auth.close_session(&admin);
         assert_eq!(auth.session(&admin), None);
     }

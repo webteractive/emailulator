@@ -3,6 +3,8 @@
 //! feed JSON-RPC messages to [`Mcp::handle`], along with what the caller may
 //! reach: an agent holding an inbox's API key works inside that inbox.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,6 +24,22 @@ const DEFAULT_BODY_CHARS: usize = 20_000;
 const MAX_WAIT: Duration = Duration::from_secs(300);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_INLINE_ATTACHMENT: usize = 256 * 1024;
+/// How often a waiting call checks that its caller still may.
+const LIVENESS_INTERVAL: Duration = Duration::from_secs(2);
+const CREDENTIALS_GONE: &str = "the credentials this request came with stopped working";
+
+/// Whether the caller of a request still may, asked before each call in a
+/// request and while a call waits. The HTTP endpoint checks the key or session
+/// the request came with; over stdio the caller is whoever started the
+/// process, and nothing is asked.
+pub type Liveness = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+
+async fn alive(liveness: Option<&Liveness>) -> bool {
+    match liveness {
+        Some(check) => check().await,
+        None => true,
+    }
+}
 
 const INSTRUCTIONS: &str = "emailulator catches the email an application under development sends, \
 instead of delivering it. Use these tools to check what was sent: after triggering something \
@@ -272,6 +290,18 @@ impl Mcp {
     /// given access. Returns `None` when nothing is owed back, as for a
     /// notification.
     pub async fn handle(&self, message: Value, access: &Access) -> Option<Value> {
+        self.handle_checked(message, access, None).await
+    }
+
+    /// As `handle`, asking `liveness` before each call and while a call waits,
+    /// so that a caller whose key stops working mid-request is refused from
+    /// that point on rather than after the fact.
+    pub async fn handle_checked(
+        &self,
+        message: Value,
+        access: &Access,
+        liveness: Option<&Liveness>,
+    ) -> Option<Value> {
         match message {
             Value::Array(batch) if batch.is_empty() => {
                 Some(rpc_error(Value::Null, -32600, "empty batch"))
@@ -279,17 +309,22 @@ impl Mcp {
             Value::Array(batch) => {
                 let mut replies = Vec::new();
                 for item in batch {
-                    if let Some(reply) = self.handle_one(item, access).await {
+                    if let Some(reply) = self.handle_one(item, access, liveness).await {
                         replies.push(reply);
                     }
                 }
                 (!replies.is_empty()).then_some(Value::Array(replies))
             }
-            other => self.handle_one(other, access).await,
+            other => self.handle_one(other, access, liveness).await,
         }
     }
 
-    async fn handle_one(&self, message: Value, access: &Access) -> Option<Value> {
+    async fn handle_one(
+        &self,
+        message: Value,
+        access: &Access,
+        liveness: Option<&Liveness>,
+    ) -> Option<Value> {
         let Some(method) = message.get("method").and_then(Value::as_str) else {
             // A response to a request we never made, or not JSON-RPC at all.
             return message
@@ -337,9 +372,12 @@ impl Mcp {
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
+                if !alive(liveness).await {
+                    return Some(rpc_error(id, -32001, CREDENTIALS_GONE));
+                }
                 // A tool that fails is still a successful protocol exchange: the
                 // model should see the failure and be able to correct itself.
-                let (payload, is_error) = match self.call(name, &args, access).await {
+                let (payload, is_error) = match self.call(name, &args, access, liveness).await {
                     Ok(value) => (value, false),
                     Err(error) => (json!({"error": error.to_string()}), true),
                 };
@@ -370,24 +408,40 @@ impl Mcp {
     /// The inbox a call is about: the caller's own if it is confined to one,
     /// otherwise the one it names, or all of them when it names none.
     async fn scope(&self, access: &Access, args: &Value) -> Result<Option<String>> {
-        // An inbox may be named by its id or by its name.
-        let requested = match arg_str(args, "inbox").map(str::to_string) {
-            Some(text) => {
-                let wanted = text.clone();
-                match self.store(move |s| s.resolve_inbox(&wanted)).await? {
-                    Some(id) => Some(id),
-                    None => return Err(InboxError::NotFound(text).into()),
+        let requested = arg_str(args, "inbox").map(|text| text.trim().to_string());
+        match access {
+            // A key confined to one inbox may name only that one, by its id or
+            // its name, read as the admin's names are: an id first, then a
+            // name. Anything else is refused in the same words and after the
+            // same lookups, whether or not such an inbox exists: telling them
+            // apart would let a key list the server's inboxes by guessing.
+            Access::Inbox(own) => {
+                if let Some(text) = requested
+                    && text != *own
+                {
+                    let id = own.clone();
+                    let wanted = text.clone();
+                    let (own_name, taken_as_id) = self
+                        .store(move |s| Ok((s.inbox_name(&id)?, s.inbox_exists(&wanted)?)))
+                        .await?;
+                    let named = own_name.is_some_and(|name| name.eq_ignore_ascii_case(&text));
+                    if taken_as_id || !named {
+                        bail!("this API key reaches one inbox only, and that is not it");
+                    }
                 }
+                Ok(Some(own.clone()))
             }
-            None => None,
-        };
-        match (access, requested) {
-            // Said the same way whether the other inbox exists or not.
-            (Access::Inbox(own), Some(other)) if *own != other => {
-                bail!("this API key reaches one inbox only, and that is not it")
-            }
-            (Access::Inbox(own), _) => Ok(Some(own.clone())),
-            (Access::Admin, requested) => Ok(requested),
+            // An inbox may be named by its id or by its name.
+            Access::Admin => match requested {
+                Some(text) => {
+                    let wanted = text.clone();
+                    match self.store(move |s| s.resolve_inbox(&wanted)).await? {
+                        Some(id) => Ok(Some(id)),
+                        None => Err(InboxError::NotFound(text).into()),
+                    }
+                }
+                None => Ok(None),
+            },
         }
     }
 
@@ -458,7 +512,13 @@ impl Mcp {
         Ok(out)
     }
 
-    async fn call(&self, name: &str, args: &Value, access: &Access) -> Result<Value> {
+    async fn call(
+        &self,
+        name: &str,
+        args: &Value,
+        access: &Access,
+        liveness: Option<&Liveness>,
+    ) -> Result<Value> {
         match name {
             "list_messages" => {
                 let filter = ListFilter {
@@ -530,7 +590,14 @@ impl Mcp {
                     ..Default::default()
                 };
                 let deadline = tokio::time::Instant::now() + timeout;
+                let mut checked = tokio::time::Instant::now();
                 loop {
+                    if checked.elapsed() >= LIVENESS_INTERVAL {
+                        if !alive(liveness).await {
+                            bail!(CREDENTIALS_GONE);
+                        }
+                        checked = tokio::time::Instant::now();
+                    }
                     let wanted = filter.clone();
                     let page = self.store(move |s| s.list(&wanted)).await?;
                     if let Some(found) = page.messages.first() {
@@ -583,13 +650,19 @@ impl Mcp {
                 } else {
                     Some(named)
                 };
-                let mut report = crate::check::check(&detail, only.as_deref());
+                // The check reads hostile markup; keep it off the async threads,
+                // as the HTTP route does.
+                let has_html = detail.html.is_some();
+                let mut report = tokio::task::spawn_blocking(move || {
+                    crate::check::check(&detail, only.as_deref())
+                })
+                .await?;
                 let max = args.get("max_issues").and_then(Value::as_u64).unwrap_or(25) as usize;
                 let total = report.issues.len();
                 report.issues.truncate(max);
                 let mut out = serde_json::to_value(&report)?;
                 out["id"] = json!(id);
-                out["has_html"] = json!(detail.html.is_some());
+                out["has_html"] = json!(has_html);
                 if total > max {
                     out["issues_omitted"] = json!(total - max);
                 }
@@ -797,6 +870,87 @@ mod tests {
         call_as(mcp, &ADMIN, name, arguments).await
     }
 
+    /// A liveness check that holds for the first `calls` times it is asked.
+    fn alive_for(calls: usize) -> Liveness {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Arc::new(move || {
+            let n = asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { n < calls })
+        })
+    }
+
+    #[tokio::test]
+    async fn an_inbox_key_reads_inbox_names_as_the_admin_does() {
+        let (mcp, store) = mcp();
+        store.create_inbox("billing").unwrap();
+        store.create_inbox("shop").unwrap();
+        // The shop inbox is named after another inbox's id.
+        store
+            .update_inbox("billing", Some("Accounts"), None)
+            .unwrap();
+        store.update_inbox("shop", Some("billing"), None).unwrap();
+        let shop = Access::Inbox("shop".into());
+
+        let (_, error) = call_as(&mcp, &shop, "list_messages", json!({"inbox": "shop"})).await;
+        assert!(!error, "its own id");
+        // An id comes before a name, for the admin and the key alike: this is
+        // the billing inbox, not the shop inbox by its name.
+        let (refused, error) =
+            call_as(&mcp, &shop, "list_messages", json!({"inbox": "billing"})).await;
+        assert!(error);
+        let (missing, _) = call_as(&mcp, &shop, "list_messages", json!({"inbox": "nowhere"})).await;
+        assert_eq!(refused, missing, "refused in the same words either way");
+    }
+
+    #[tokio::test]
+    async fn a_key_that_dies_mid_batch_stops_the_calls_after_it() {
+        let (mcp, store) = mcp();
+        let id = deliver(&store, "bob@x.test", "Keep me", "x");
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "list_messages", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "delete_messages", "arguments": {"id": id}}},
+        ]);
+        let alive = alive_for(1);
+        let replies = mcp
+            .handle_checked(batch, &ADMIN, Some(&alive))
+            .await
+            .unwrap();
+        assert_eq!(replies[0]["result"]["isError"], false);
+        assert_eq!(replies[1]["error"]["code"], -32001, "{}", replies[1]);
+        assert!(store.get(id).unwrap().is_some(), "the delete never ran");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_key_that_dies_while_waiting_ends_the_wait() {
+        let (mcp, _store) = mcp();
+        let alive = alive_for(1);
+        let started = tokio::time::Instant::now();
+        let reply = mcp
+            .handle_checked(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": "wait_for_message",
+                                  "arguments": {"timeout_seconds": 120}}}),
+                &ADMIN,
+                Some(&alive),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply["result"]["isError"], true);
+        assert!(
+            reply["result"]["structuredContent"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("stopped working"),
+            "{reply}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "it did not wait out the timeout"
+        );
+    }
+
     #[tokio::test]
     async fn negotiates_a_protocol_version() {
         let (mcp, _) = mcp();
@@ -908,6 +1062,12 @@ mod tests {
         )
         .await;
         assert!(error, "{refused}");
+        // And in the same words as an inbox that does not exist, so a key
+        // cannot find out which inboxes there are.
+        let (missing, error) =
+            call_as(&mcp, &billing, "list_messages", json!({"inbox": "nowhere"})).await;
+        assert!(error, "{missing}");
+        assert_eq!(missing, refused);
 
         // Another inbox's message is out of reach by id, in every tool that takes one.
         for (tool, args) in [

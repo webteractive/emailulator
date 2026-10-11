@@ -21,16 +21,15 @@ use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::compose::SendRequest;
-use crate::mcp::Mcp;
-use crate::model::{ListFilter, Source};
-use crate::security::{Access, Auth};
+use crate::mcp::{Liveness, Mcp};
+use crate::model::{Event, ListFilter, Source};
+use crate::security::{Access, Auth, Credential, InboxKey, Session, hash_api_key};
 use crate::store::{DEFAULT_INBOX, InboxError, Incoming, Store};
 
 const SESSION_COOKIE: &str = "emailulator_session";
@@ -256,24 +255,83 @@ async fn access_for_secret(state: &Shared, secret: &str) -> ApiResult<Option<Acc
     Ok(inbox.map(Access::Inbox))
 }
 
-/// Who is asking. `None` means nobody the server recognizes.
-async fn resolve(state: &Shared, headers: &HeaderMap) -> ApiResult<Option<Access>> {
+/// What a request or session keeps of the inbox key that opened it, so it can
+/// be checked again later: its hash, never the key. `None` for the admin.
+fn inbox_key(access: &Access, secret: &str) -> Option<InboxKey> {
+    access.inbox().map(|inbox| InboxKey {
+        inbox: inbox.to_string(),
+        hash: hash_api_key(secret),
+    })
+}
+
+/// Who is asking, and how they showed it. `None` means nobody the server
+/// recognizes. The credential is kept beside the access it grants, so a
+/// request that outlives its own authorization can check it again.
+async fn resolve(state: &Shared, headers: &HeaderMap) -> ApiResult<Option<(Access, Credential)>> {
     // A credential that was presented and is wrong is refused even where none
     // is needed: falling back to open access would hide a revoked key.
     if let Some(token) = bearer_token(headers) {
-        return access_for_secret(state, token).await;
+        let access = access_for_secret(state, token).await?;
+        return Ok(access.map(|access| {
+            let credential =
+                inbox_key(&access, token).map_or(Credential::Standing, Credential::Key);
+            (access, credential)
+        }));
     }
-    if let Some(access) = session_cookie(headers).and_then(|id| state.config.auth.session(id)) {
-        // A session outlives the request that opened it, so check that the
-        // inbox it is confined to is still there.
-        if let Some(inbox) = access.inbox().map(str::to_string)
-            && !store(state, move |s| s.inbox_exists(&inbox)).await?
-        {
-            return Ok(None);
+    if let Some(id) = session_cookie(headers)
+        && let Some(session) = state.config.auth.session(id)
+    {
+        // A session outlives the request that opened it, so check that the key
+        // it was opened with still opens its inbox. That also ends it when the
+        // key was revoked or regenerated from the command line, or the inbox
+        // was deleted and made again under the same id. A session whose key is
+        // gone is refused, not let through as open access: on a server that
+        // asks for nothing, that would turn an inbox's viewer into an admin.
+        if session_holds(state, &session).await? {
+            return Ok(Some((
+                session.access(),
+                Credential::Session(id.to_string()),
+            )));
         }
-        return Ok(Some(access));
+        state.config.auth.close_session(id);
+        return Ok(None);
     }
-    Ok((!state.config.auth.required()).then_some(Access::Admin))
+    // A cookie for a session that has ended, as after a restart, is no
+    // credential at all.
+    Ok((!state.config.auth.required()).then_some((Access::Admin, Credential::Standing)))
+}
+
+async fn key_holds(state: &Shared, key: &InboxKey) -> ApiResult<bool> {
+    let InboxKey { inbox, hash } = key.clone();
+    store(state, move |s| s.key_hash_opens(&hash, &inbox)).await
+}
+
+async fn session_holds(state: &Shared, session: &Session) -> ApiResult<bool> {
+    match session {
+        Session::Admin => Ok(true),
+        Session::Inbox(key) => key_holds(state, key).await,
+    }
+}
+
+/// Whether a long-lived request's caller still may: `None` when the store
+/// could not say, as when another process holds a write lock past the busy
+/// timeout. What to do about not knowing is the caller's to decide.
+async fn credential_holds(state: &Shared, credential: &Credential) -> Option<bool> {
+    let holds = match credential {
+        Credential::Standing => Ok(true),
+        Credential::Key(key) => key_holds(state, key).await,
+        Credential::Session(id) => match state.config.auth.session(id) {
+            Some(session) => session_holds(state, &session).await,
+            None => Ok(false),
+        },
+    };
+    match holds {
+        Ok(holds) => Some(holds),
+        Err(error) => {
+            tracing::warn!(error = %error.message, "could not check a credential");
+            None
+        }
+    }
 }
 
 /// The host of a `Host` header or an origin's authority, without the port.
@@ -351,8 +409,9 @@ async fn guard(State(state): State<Shared>, mut request: Request, next: Next) ->
             forbidden("cross-origin request refused")
         } else if protected {
             match resolve(&state, headers).await {
-                Ok(Some(access)) => {
+                Ok(Some((access, credential))) => {
                     request.extensions_mut().insert(access);
+                    request.extensions_mut().insert(credential);
                     next.run(request).await
                 }
                 Ok(None) => {
@@ -453,7 +512,7 @@ fn describe(access: Option<&Access>) -> Value {
 }
 
 async fn session_status(State(state): State<Shared>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    let access = resolve(&state, &headers).await?;
+    let access = resolve(&state, &headers).await?.map(|(access, _)| access);
     let mut status = describe(access.as_ref());
     status["auth_required"] = json!(state.config.auth.required());
     Ok(Json(status))
@@ -489,7 +548,8 @@ async fn session_open(
     };
     let auth = &state.config.auth;
     let body = describe(Some(&access));
-    let id = auth.open_session(access);
+    let session = inbox_key(&access, login.token.trim()).map_or(Session::Admin, Session::Inbox);
+    let id = auth.open_session(session);
     let mut response = Json(body).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
@@ -701,8 +761,9 @@ async fn regenerate_key(
             "key {key} of inbox `{inbox}`"
         )));
     };
-    // A browser signed in with the old value holds a session, not the key.
-    state.config.auth.close_inbox_sessions(&inbox);
+    // Sessions opened with the old value end on their next request, when
+    // their key's hash no longer matches; those opened with the inbox's other
+    // keys go on.
     tracing::info!(%inbox, key, "API key regenerated");
     let mut body = serde_json::to_value(&record).map_err(anyhow::Error::from)?;
     body["key"] = json!(value);
@@ -721,9 +782,8 @@ async fn revoke_key(
             "key {key} of inbox `{inbox}`"
         )));
     }
-    // A browser signed in with the key holds a session, not the key; end those
-    // too, or revoking would not lock it out.
-    state.config.auth.close_inbox_sessions(&inbox);
+    // Sessions opened with this key end on their next request; those opened
+    // with the inbox's other keys go on.
     tracing::info!(%inbox, key, "API key revoked");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1104,27 +1164,92 @@ async fn message_attachment(
         .into_response())
 }
 
+/// How often an idle event stream checks that its caller may still listen.
+const EVENTS_RECHECK: Duration = Duration::from_secs(15);
+
+/// How long a check of an event stream's caller stands before an event needs
+/// another. A burst of mail costs a check a second, not one per message.
+const EVENTS_CHECK_FRESH: Duration = Duration::from_secs(1);
+
+/// How long an event stream goes on while its caller cannot be checked at
+/// all, before it gives up.
+const EVENTS_UNKNOWN_LIMIT: Duration = Duration::from_secs(60);
+
 async fn events(
     State(state): State<Shared>,
     Extension(access): Extension<Access>,
-) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
-    let stream = BroadcastStream::new(state.store.subscribe()).filter_map(move |event| {
-        Some(Ok(match event {
-            // A viewer confined to one inbox hears only of that inbox.
-            Ok(event) if access.inbox().is_none_or(|inbox| event.concerns(inbox)) => {
-                SseEvent::default().json_data(&event).unwrap_or_default()
+    Extension(credential): Extension<Credential>,
+) -> impl IntoResponse {
+    // Subscribed here, before the response goes out, so nothing sent after
+    // the stream opens is missed.
+    let mut events = state.store.subscribe();
+    let (sender, receiver) = mpsc::channel::<Result<SseEvent, Infallible>>(64);
+    // The stream outlives the request that was authorized. Its caller is
+    // checked again while it idles, when keys change, and before an event when
+    // the last check is more than a moment old, and it ends once the caller no
+    // longer may: a revoked or regenerated key, a deleted inbox, a closed
+    // session. While the store cannot answer it goes on, for a while.
+    tokio::spawn(async move {
+        let mut recheck = tokio::time::interval(EVENTS_RECHECK);
+        recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        recheck.tick().await;
+        let mut checked = tokio::time::Instant::now();
+        let mut unknown_since: Option<tokio::time::Instant> = None;
+        let mut holds = async |checked: &mut tokio::time::Instant| -> bool {
+            match credential_holds(&state, &credential).await {
+                Some(holds) => {
+                    unknown_since = None;
+                    *checked = tokio::time::Instant::now();
+                    holds
+                }
+                None => {
+                    unknown_since
+                        .get_or_insert_with(tokio::time::Instant::now)
+                        .elapsed()
+                        < EVENTS_UNKNOWN_LIMIT
+                }
             }
-            Ok(_) => return None,
-            // The viewer fell behind and missed events; tell it to reload.
-            Err(_) => SseEvent::default().data(r#"{"type":"resync"}"#),
-        }))
+        };
+        loop {
+            let event = tokio::select! {
+                () = sender.closed() => return,
+                _ = recheck.tick() => {
+                    if !holds(&mut checked).await {
+                        return;
+                    }
+                    continue;
+                }
+                event = events.recv() => event,
+            };
+            let data = match event {
+                // A viewer confined to one inbox hears only of that inbox.
+                Ok(event) if access.inbox().is_none_or(|inbox| event.concerns(inbox)) => {
+                    if (matches!(event, Event::Inboxes) || checked.elapsed() > EVENTS_CHECK_FRESH)
+                        && !holds(&mut checked).await
+                    {
+                        return;
+                    }
+                    SseEvent::default().json_data(&event).unwrap_or_default()
+                }
+                Ok(_) => continue,
+                // The viewer fell behind and missed events; tell it to reload.
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    SseEvent::default().data(r#"{"type":"resync"}"#)
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            };
+            if sender.send(Ok(data)).await.is_err() {
+                return;
+            }
+        }
     });
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(ReceiverStream::new(receiver)).keep_alive(KeepAlive::default())
 }
 
 async fn mcp(
     State(state): State<Shared>,
     Extension(access): Extension<Access>,
+    Extension(credential): Extension<Credential>,
     body: Bytes,
 ) -> Response {
     let message: Value = match serde_json::from_slice(&body) {
@@ -1135,7 +1260,41 @@ async fn mcp(
             return (StatusCode::BAD_REQUEST, Json(reply)).into_response();
         }
     };
-    match state.mcp.handle(message, &access).await {
+    // A request can hold a batch of calls, and wait_for_message can take
+    // minutes: the caller is checked again before each call and while one
+    // waits, so a key revoked mid-request stops working from that point. The
+    // request was just authorized, so the first second needs no check; a store
+    // that cannot answer does not stop a call.
+    let alive: Liveness = {
+        let state = state.clone();
+        let checked = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+        Arc::new(move || {
+            let state = state.clone();
+            let credential = credential.clone();
+            let checked = checked.clone();
+            Box::pin(async move {
+                let fresh = checked
+                    .lock()
+                    .map(|at| at.elapsed() < Duration::from_secs(1))
+                    .unwrap_or(false);
+                if fresh {
+                    return true;
+                }
+                let holds = credential_holds(&state, &credential).await;
+                if holds.is_some()
+                    && let Ok(mut at) = checked.lock()
+                {
+                    *at = std::time::Instant::now();
+                }
+                holds.unwrap_or(true)
+            })
+        })
+    };
+    match state
+        .mcp
+        .handle_checked(message, &access, Some(&alive))
+        .await
+    {
         Some(reply) => Json(reply).into_response(),
         None => StatusCode::ACCEPTED.into_response(),
     }
@@ -1308,6 +1467,20 @@ mod tests {
             parts.headers,
             String::from_utf8_lossy(&bytes).into_owned(),
         )
+    }
+
+    /// Sign the web UI in with `token` and return the cookie to send back.
+    async fn sign_in(app: &Router, token: &str) -> String {
+        let login = json_request(request("POST", "/api/v1/session"), json!({"token": token}));
+        let (status, headers, body) = send(app, login).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        headers["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
     }
 
     async fn json(app: &Router, request: axum::http::Request<Body>) -> (StatusCode, Value) {
@@ -1849,6 +2022,104 @@ mod tests {
         assert_eq!(
             send(&app, with_cookie("GET", &own)).await.0,
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_ends_when_its_key_is_replaced_behind_the_servers_back() {
+        let (app, store, billing, _marketing, invoice, _promo) = two_inboxes().await;
+        let cookie = sign_in(&app, &billing).await;
+        let own = || {
+            empty(
+                request("GET", &format!("/api/v1/messages/{invoice}"))
+                    .header("cookie", cookie.clone()),
+            )
+        };
+        assert_eq!(send(&app, own()).await.0, StatusCode::OK);
+
+        // As `emailulator key regenerate` does: straight to the store, which
+        // cannot reach the server's sessions.
+        let key = store.keys(Some("billing")).unwrap().remove(0);
+        store.regenerate_key(key.id, None).unwrap().unwrap();
+        assert_eq!(send(&app, own()).await.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_cookie_for_an_ended_session_is_no_credential_on_an_open_server() {
+        let (app, _) = app(None, true);
+        let stale = empty(
+            request("GET", "/api/v1/messages").header("cookie", format!("{SESSION_COOKIE}=gone")),
+        );
+        assert_eq!(send(&app, stale).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn revoking_one_key_leaves_sessions_opened_with_another() {
+        let (app, store, _billing, _marketing, invoice, _promo) = two_inboxes().await;
+        let (second_key, second) = store.create_key("billing", "browser").unwrap();
+        let cookie = sign_in(&app, &second).await;
+        let own = || {
+            empty(
+                request("GET", &format!("/api/v1/messages/{invoice}"))
+                    .header("cookie", cookie.clone()),
+            )
+        };
+
+        // Revoke the other key, the one `two_inboxes` made, through the API.
+        let first = store
+            .keys(Some("billing"))
+            .unwrap()
+            .into_iter()
+            .find(|key| key.id != second_key.id)
+            .unwrap();
+        let revoke = with_key(
+            "DELETE",
+            &format!("/api/v1/inboxes/billing/keys/{}", first.id),
+            TOKEN,
+        );
+        assert_eq!(send(&app, empty(revoke)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(send(&app, own()).await.0, StatusCode::OK, "still signed in");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_event_stream_ends_when_its_key_stops_working() {
+        let (app, store, billing, _marketing, _invoice, _promo) = two_inboxes().await;
+        let response = app
+            .clone()
+            .oneshot(empty(with_key("GET", "/api/v1/events", &billing)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = tokio::spawn(to_bytes(response.into_body(), usize::MAX));
+
+        // Mail before the key goes is heard; mail after it is not.
+        let deliver = |subject: &str| {
+            store
+                .insert(Incoming {
+                    raw: format!("From: a@x.test\r\nTo: b@x.test\r\nSubject: {subject}\r\n\r\nx")
+                        .into_bytes(),
+                    inbox: "billing".into(),
+                    envelope_from: None,
+                    envelope_to: Vec::new(),
+                    source: Source::Api,
+                })
+                .unwrap();
+        };
+        deliver("Before");
+        let key = store.keys(Some("billing")).unwrap().remove(0);
+        assert!(store.revoke_key(key.id, None).unwrap());
+        deliver("After");
+
+        let bytes = tokio::time::timeout(Duration::from_secs(120), body)
+            .await
+            .expect("the stream ends once its key is gone")
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("Before"), "the stream was listening: {text}");
+        assert!(
+            !text.contains("After"),
+            "nothing is delivered after revocation: {text}"
         );
     }
 

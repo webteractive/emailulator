@@ -342,6 +342,34 @@ and set `X-Forwarded-Proto: https`: the first is how the server tells its own
 web UI from another site, the second is what marks the session cookie `Secure`.
 A proxy only covers HTTP, so SMTP still needs the certificate to be encrypted.
 
+**Behind a proxy on the same machine, set the admin token anyway.** The server
+listens on `127.0.0.1` there, and a loopback listener needs no token, so nothing
+stops it starting without one. Without a token the only guard left is the
+`Host` check, and a proxy that does not pass the original host through sends
+`Host: 127.0.0.1:8025`, which passes it: every captured email is then open to
+whoever reaches the proxy. Set `EMAILULATOR_REQUIRE_AUTH_TOKEN=1` beside the
+token, and the server refuses to start if the token is ever missing:
+
+```sh
+EMAILULATOR_REQUIRE_AUTH_TOKEN=1 \
+EMAILULATOR_AUTH_TOKEN_FILE=/home/emailulator/token \
+emailulator run
+```
+
+For nginx, for instance on Laravel Forge:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8025;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;        # the live event stream
+    proxy_read_timeout 1h;
+    client_max_body_size 25m;   # the largest message accepted
+}
+```
+
 ### Options
 
 Every flag has an environment variable; `emailulator run --help` lists them all.
@@ -353,6 +381,7 @@ Every flag has an environment variable; `emailulator run --help` lists them all.
 | `EMAILULATOR_DATA_DIR` | platform data dir | Where the database lives |
 | `EMAILULATOR_MEMORY` | off | Keep messages in memory only |
 | `EMAILULATOR_AUTH_TOKEN` / `_FILE` | none | The admin token (16+ characters) |
+| `EMAILULATOR_REQUIRE_AUTH_TOKEN` | off | Refuse to start without the admin token, even on loopback |
 | `EMAILULATOR_PROVISION` | none | `inbox=key,…` made valid at startup |
 | `EMAILULATOR_TLS_CERT`, `EMAILULATOR_TLS_KEY` | none | PEM files; enables HTTPS and STARTTLS |
 | `EMAILULATOR_ALLOW_ANONYMOUS_HTTP` | off | Serve an exposed HTTP listener with no token |
@@ -381,7 +410,11 @@ content is written by whoever sends it. The design assumes both.
 - Keys are stored as SHA-256 hashes and shown once. The exception is the default
   inbox's starter key, which is also kept readable in the database until it is
   regenerated, so anyone who can read that file can read it. Revoking or
-  regenerating a key also ends any browser session opened with it.
+  regenerating a key, from the API or the command line, also ends the browser
+  sessions opened with it at their next request, and the live event streams and
+  MCP calls using it: at once when it is done through the API, within a second
+  or so from the command line, which cannot reach the server. Sessions opened
+  with the inbox's other keys go on.
 - The web UI signs in with either credential and gets a random session id in an
   `HttpOnly; SameSite=Strict` cookie (`Secure` over HTTPS); the credential
   itself is never stored in the browser. Sessions end on sign-out, after seven

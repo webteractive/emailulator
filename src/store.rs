@@ -874,6 +874,16 @@ impl Store {
         Ok(Some((record, key)))
     }
 
+    /// Whether the key with this hash still exists and belongs to `inbox`. For
+    /// checking a session again: unlike `inbox_for_key` it records no use.
+    pub fn key_hash_opens(&self, hash: &str, inbox: &str) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM api_keys WHERE hash = ? AND inbox = ?)",
+            params![hash, inbox],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Revoke a key. `inbox` limits the reach to that inbox's keys.
     pub fn revoke_key(&self, id: i64, inbox: Option<&str>) -> Result<bool> {
         let removed = self.conn().execute(
@@ -1093,7 +1103,8 @@ impl Store {
         Ok(conn.query_row(&sql, [id], summary_from_row).optional()?)
     }
 
-    fn inbox_name(&self, id: &str) -> Result<Option<String>> {
+    /// An inbox's name, looked up by id alone: unlike `inbox`, it counts no mail.
+    pub fn inbox_name(&self, id: &str) -> Result<Option<String>> {
         let conn = self.conn();
         Ok(conn
             .query_row("SELECT name FROM inboxes WHERE id = ?", [id], |row| {

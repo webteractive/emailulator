@@ -351,12 +351,26 @@ pub struct Notice {
     pub message: String,
 }
 
+/// How much of a message's HTML the check reads. Email content is hostile,
+/// and this runs on the server, so the work is bounded by the input as well as
+/// by the scanners being linear. Gmail clips at 102 KB, so a message this long
+/// has bigger problems than its CSS.
+const MAX_SCANNED: usize = 512 * 1024;
+
+/// How deeply at-rules may nest before the scanner stops descending.
+const MAX_CSS_DEPTH: usize = 16;
+
 /// Check a message against every client, or only the named families.
 pub fn check(detail: &MessageDetail, only: Option<&[String]>) -> Report {
     let data = dataset();
     let mut found = Found::default();
     if let Some(html) = &detail.html {
-        scan_html(html, &mut found);
+        let mut cut = html.len().min(MAX_SCANNED);
+        while !html.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        found.truncated = cut < html.len();
+        scan_html(&html[..cut], &mut found);
     }
     for attachment in &detail.attachments {
         if attachment.content_type.starts_with("image/") {
@@ -567,6 +581,23 @@ fn notices(detail: &MessageDetail, found: &Found) -> Vec<Notice> {
                 ),
             });
         }
+        if found.truncated {
+            notices.push(Notice {
+                code: "check-truncated",
+                message: format!(
+                    "Only the first {} KB of the HTML was checked.",
+                    MAX_SCANNED / 1024
+                ),
+            });
+        }
+        if found.css_too_deep {
+            notices.push(Notice {
+                code: "check-css-too-deep",
+                message: format!(
+                    "Some CSS is nested more than {MAX_CSS_DEPTH} at-rules deep, and what is inside was not checked."
+                ),
+            });
+        }
         if found.conditional_comments > 0 {
             notices.push(Notice {
                 code: "outlook-conditional-comments",
@@ -590,6 +621,10 @@ struct Found {
     counts: BTreeMap<String, usize>,
     images_without_alt: usize,
     conditional_comments: usize,
+    /// The HTML was longer than the check reads.
+    truncated: bool,
+    /// Some CSS was nested deeper than the check reads.
+    css_too_deep: bool,
 }
 
 impl Found {
@@ -727,6 +762,7 @@ fn attributes(text: &str) -> Vec<(String, String)> {
     let mut attributes = Vec::new();
     let mut rest = text.trim_start_matches(|c: char| c.is_whitespace() || c == '/');
     while !rest.is_empty() {
+        let before = rest.len();
         let name_end = rest
             .find(|c: char| c.is_whitespace() || matches!(c, '=' | '/' | '>'))
             .unwrap_or(rest.len());
@@ -753,6 +789,11 @@ fn attributes(text: &str) -> Vec<(String, String)> {
             attributes.push((name, value));
         }
         rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '/');
+        // A quote or `>` where a name should be, such as in `<a '>'>`, is not
+        // an attribute. Step over it rather than stand still.
+        if rest.len() == before {
+            rest = &rest[rest.chars().next().map_or(0, char::len_utf8)..];
+        }
     }
     attributes
 }
@@ -841,7 +882,13 @@ fn element(name: &str, attributes: &[(String, String)], found: &mut Found) {
 /// A stylesheet: rules, and at-rules that may hold more rules.
 fn scan_css(css: &str, found: &mut Found) {
     let css = strip_comments(css, found);
-    let mut rest = css.as_str();
+    scan_rules(&css, 0, found);
+}
+
+/// Rules at one level of nesting. Deeper than `MAX_CSS_DEPTH` is not read: a
+/// stylesheet of nothing but `@media{` would otherwise exhaust the stack.
+fn scan_rules(css: &str, depth: usize, found: &mut Found) {
+    let mut rest = css;
     loop {
         rest = rest.trim_start();
         let Some(stop) = rest.find(['{', ';']) else {
@@ -849,8 +896,10 @@ fn scan_css(css: &str, found: &mut Found) {
         };
         let prelude = rest[..stop].trim();
         if rest.as_bytes()[stop] == b';' {
-            // A statement with no block, such as @import.
-            at_rule(prelude, found);
+            // A statement with no block, such as @import, or a stray semicolon.
+            if prelude.starts_with('@') {
+                at_rule(prelude, found);
+            }
             rest = &rest[stop + 1..];
             continue;
         }
@@ -860,7 +909,13 @@ fn scan_css(css: &str, found: &mut Found) {
         if prelude.starts_with('@') {
             // Rules nest inside these; the others hold declarations or frames.
             match at_rule(prelude, found) {
-                "media" | "supports" | "layer" | "container" => scan_css(body, found),
+                "media" | "supports" | "layer" | "container" => {
+                    if depth < MAX_CSS_DEPTH {
+                        scan_rules(body, depth + 1, found);
+                    } else {
+                        found.css_too_deep = true;
+                    }
+                }
                 "font-face" | "page" => declarations(body, found),
                 _ => {}
             }
@@ -906,11 +961,14 @@ fn block_end(text: &str, start: usize) -> usize {
 
 /// Record an at-rule and return its name.
 fn at_rule<'a>(prelude: &'a str, found: &mut Found) -> &'a str {
-    let name_end = prelude[1..]
+    let Some(after) = prelude.strip_prefix('@') else {
+        return "";
+    };
+    let name_end = after
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
-        .map_or(prelude.len(), |i| i + 1);
-    let name = &prelude[1..name_end];
-    let condition = prelude[name_end..].to_ascii_lowercase();
+        .unwrap_or(after.len());
+    let name = &after[..name_end];
+    let condition = after[name_end..].to_ascii_lowercase();
     match name.to_ascii_lowercase().as_str() {
         "media" => {
             found.add("css-at-media");
@@ -997,9 +1055,14 @@ fn selectors(list: &str, found: &mut Found) {
                     }
                     in_compound = 0;
                     // A space between two compounds, not around a combinator.
-                    let next = selector[i..].trim_start().chars().next();
+                    // Looked ahead from the first space of a run only, so a
+                    // long run is crossed once rather than once per space.
                     if !matches!(previous, '>' | '+' | '~' | ' ')
-                        && next.is_some_and(|n| !matches!(n, '>' | '+' | '~'))
+                        && selector[i..]
+                            .trim_start()
+                            .chars()
+                            .next()
+                            .is_some_and(|n| !matches!(n, '>' | '+' | '~'))
                     {
                         found.add("css-selector-descendant");
                     }
@@ -1158,30 +1221,37 @@ fn value(value: &str, found: &mut Found) {
         found.add("css-unit-initial");
     }
 
-    // Units: letters, or a percent sign, directly after a number.
+    // Units: letters, or a percent sign, directly after a number. Each run of
+    // digits and dots is read once.
     let bytes = value.as_bytes();
     let mut seen: Vec<&str> = Vec::new();
-    for (i, byte) in bytes.iter().enumerate() {
-        if !byte.is_ascii_digit() {
+    let mut i = 0;
+    while i < bytes.len() {
+        if !(bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+            i += 1;
             continue;
         }
-        // Skip digits inside a name or a hex colour.
-        let number_start = value[..=i]
-            .rfind(|c: char| !(c.is_ascii_digit() || c == '.'))
-            .map_or(0, |at| at + 1);
-        if number_start > 0 && matches!(bytes[number_start - 1], b'#' | b'a'..=b'z' | b'_') {
+        let number_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+            i += 1;
+        }
+        // Skip digits inside a name or a hex colour, and a dot with no digits.
+        if !bytes[number_start..i].iter().any(u8::is_ascii_digit)
+            || bytes[i - 1] == b'.'
+            || (number_start > 0 && matches!(bytes[number_start - 1], b'#' | b'a'..=b'z' | b'_'))
+        {
             continue;
         }
-        let after = &value[i + 1..];
-        if after.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
-            continue;
-        }
+        let after = &value[i..];
+        // No unit is longer than four letters; read no further than that.
         let unit: &str = if after.starts_with('%') {
             "percent"
         } else {
             let end = after
-                .find(|c: char| !c.is_ascii_alphabetic())
-                .unwrap_or(after.len());
+                .bytes()
+                .take(5)
+                .take_while(u8::is_ascii_alphabetic)
+                .count();
             &after[..end]
         };
         if matches!(
@@ -1208,16 +1278,20 @@ fn value(value: &str, found: &mut Found) {
     }
 }
 
-/// The addresses inside each `url(...)` of a value.
+/// The addresses inside each `url(...)` of a value, read in one pass: each
+/// search starts after the last address found.
 fn urls(value: &str) -> Vec<&str> {
-    value
-        .match_indices("url(")
-        .filter_map(|(at, _)| {
-            let inner = &value[at + 4..];
-            let end = inner.find(')')?;
-            Some(inner[..end].trim().trim_matches(['"', '\'']))
-        })
-        .collect()
+    let mut found = Vec::new();
+    let mut rest = value;
+    while let Some(at) = rest.find("url(") {
+        let inner = &rest[at + 4..];
+        let Some(end) = inner.find(')') else {
+            break;
+        };
+        found.push(inner[..end].trim().trim_matches(['"', '\'']));
+        rest = &inner[end + 1..];
+    }
+    found
 }
 
 #[cfg(test)]
@@ -1524,6 +1598,61 @@ mod tests {
                 .issues
                 .iter()
                 .all(|i| i.clients.iter().all(|c| c.family == "outlook"))
+        );
+    }
+
+    #[test]
+    fn hostile_markup_is_read_in_bounded_time_and_without_panicking() {
+        let style = |css: &str| format!("<style>{css}</style>");
+        let cases = [
+            // Once an endless loop in the attribute reader.
+            "<a '>'>".to_string(),
+            "<img src=a.png \"b>\">".to_string(),
+            // Once a stack overflow, nesting without end.
+            style(&"@media{".repeat(50_000)),
+            // Once quadratic: a long number, a long run of spaces in a
+            // selector, and url( inside url( inside url(.
+            format!("<p style=\"width:{}\">", "1".repeat(400_000)),
+            style(&format!("a{}b{{}}", " ".repeat(400_000))),
+            format!("<p style=\"background:{}\">", "url(".repeat(100_000)),
+            // Once panics: a statement that is not an at-rule.
+            style(";"),
+            style("é;"),
+            style("a{};"),
+        ];
+        for html in cases {
+            let started = std::time::Instant::now();
+            check(&message(Some(&html), Some("x")), None);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "took {:?} on input starting {:?}",
+                started.elapsed(),
+                &html[..html.len().min(40)]
+            );
+        }
+    }
+
+    #[test]
+    fn css_nested_past_the_limit_is_noted_not_read() {
+        let html = format!(
+            "<style>{}a{{display:grid}}{}</style>",
+            "@media screen{".repeat(MAX_CSS_DEPTH + 1),
+            "}".repeat(MAX_CSS_DEPTH + 1)
+        );
+        let report = check(&message(Some(&html), Some("x")), None);
+        let codes: Vec<_> = report.notices.iter().map(|n| n.code).collect();
+        assert!(codes.contains(&"check-css-too-deep"), "{codes:?}");
+    }
+
+    #[test]
+    fn only_the_start_of_a_long_message_is_read() {
+        let html = format!("<p>{}</p><video></video>", "x".repeat(MAX_SCANNED));
+        let report = check(&message(Some(&html), Some("x")), None);
+        let codes: Vec<_> = report.notices.iter().map(|n| n.code).collect();
+        assert!(codes.contains(&"check-truncated"), "{codes:?}");
+        assert!(
+            report.issues.iter().all(|issue| issue.slug != "html-video"),
+            "nothing past the cut is reported"
         );
     }
 

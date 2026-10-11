@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use clap::builder::BoolishValueParser;
 use clap::{Args, Parser, Subcommand};
 use emailulator::mcp::{self, Mcp};
 use emailulator::security::{self, Access, TlsFiles};
@@ -213,7 +214,7 @@ struct RunArgs {
     store: StoreArgs,
 
     /// Keep messages in memory only; they are gone when the server stops
-    #[arg(long, env = "EMAILULATOR_MEMORY", conflicts_with = "data_dir")]
+    #[arg(long, env = "EMAILULATOR_MEMORY", value_parser = BoolishValueParser::new(), conflicts_with = "data_dir")]
     memory: bool,
 
     /// Token required by the API, MCP endpoint and web UI.
@@ -250,11 +251,21 @@ struct RunArgs {
     provision: Vec<(String, String)>,
 
     /// Serve HTTP on a non-loopback address with no auth token
-    #[arg(long, env = "EMAILULATOR_ALLOW_ANONYMOUS_HTTP")]
+    #[arg(long, env = "EMAILULATOR_ALLOW_ANONYMOUS_HTTP", value_parser = BoolishValueParser::new())]
     allow_anonymous_http: bool,
 
+    /// Refuse to start without an auth token, even on a loopback address; for
+    /// running behind a reverse proxy on the same machine
+    #[arg(
+        long,
+        env = "EMAILULATOR_REQUIRE_AUTH_TOKEN",
+        value_parser = BoolishValueParser::new(),
+        conflicts_with = "allow_anonymous_http"
+    )]
+    require_auth_token: bool,
+
     /// On a non-loopback address, accept SMTP from clients with no inbox key
-    #[arg(long, env = "EMAILULATOR_ALLOW_ANONYMOUS_SMTP")]
+    #[arg(long, env = "EMAILULATOR_ALLOW_ANONYMOUS_SMTP", value_parser = BoolishValueParser::new())]
     allow_anonymous_smtp: bool,
 
     /// PEM certificate chain; with --tls-key, enables HTTPS and SMTP STARTTLS
@@ -293,7 +304,7 @@ struct RunArgs {
     max_storage: u64,
 
     /// Do not serve the web UI; the API and MCP endpoint stay available
-    #[arg(long, env = "EMAILULATOR_NO_UI")]
+    #[arg(long, env = "EMAILULATOR_NO_UI", value_parser = BoolishValueParser::new())]
     no_ui: bool,
 
     /// Log verbosity: error, warn, info, debug or trace
@@ -383,6 +394,7 @@ impl RunArgs {
             auth_token: secret(self.auth_token, self.auth_token_file, "auth token")?,
             provision: self.provision,
             allow_anonymous_http: self.allow_anonymous_http,
+            require_auth_token: self.require_auth_token,
             allow_anonymous_smtp: self.allow_anonymous_smtp,
             tls: self
                 .tls_cert

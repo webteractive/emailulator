@@ -60,6 +60,11 @@ pub struct Config {
     /// Permit an HTTP listener that is reachable from other machines and has
     /// no auth token.
     pub allow_anonymous_http: bool,
+    /// Refuse to start without the admin token even on a loopback listener.
+    /// Behind a reverse proxy on the same machine every request arrives from
+    /// loopback, and a proxy that does not pass the `Host` header through
+    /// would otherwise serve every captured email to whoever reaches it.
+    pub require_auth_token: bool,
     /// Let an SMTP listener that is reachable from other machines accept mail
     /// from clients that do not authenticate with an inbox key.
     pub allow_anonymous_smtp: bool,
@@ -79,6 +84,7 @@ impl Default for Config {
             auth_token: None,
             provision: Vec::new(),
             allow_anonymous_http: false,
+            require_auth_token: false,
             allow_anonymous_smtp: false,
             tls: None,
             ui: true,
@@ -106,6 +112,12 @@ impl Config {
         let http_exposed = !self.http_addr.ip().is_loopback();
         let smtp_exposed = !self.smtp_addr.ip().is_loopback();
 
+        if self.require_auth_token && self.auth_token.is_none() {
+            bail!(
+                "an auth token is required (--require-auth-token) but none is set.\n\
+                 Set EMAILULATOR_AUTH_TOKEN (generate one with `emailulator token`)."
+            );
+        }
         if http_exposed && self.auth_token.is_none() {
             if !self.allow_anonymous_http {
                 bail!(
@@ -343,6 +355,20 @@ mod tests {
             3,
             "open HTTP, open SMTP, no STARTTLS: {warnings:?}"
         );
+    }
+
+    #[test]
+    fn a_required_token_is_required_on_loopback_too() {
+        let mut config = Config {
+            data_dir: None,
+            require_auth_token: true,
+            ..Config::default()
+        };
+        let error = config.check().unwrap_err().to_string();
+        assert!(error.contains("EMAILULATOR_AUTH_TOKEN"), "{error}");
+
+        config.auth_token = Some(security::generate_token());
+        assert!(config.check().unwrap().is_empty());
     }
 
     #[tokio::test]

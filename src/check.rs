@@ -274,7 +274,7 @@ fn dataset() -> &'static Dataset {
             .filter(|(id, _)| !MAJOR_CLIENTS.contains(&id.as_str()))
             .map(|(id, name)| (id.clone(), name.clone()))
             .collect();
-        rest.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        rest.sort_by_cached_key(|(_, name)| name.to_lowercase());
         families.extend(rest);
 
         Dataset {

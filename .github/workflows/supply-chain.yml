@@ -48,8 +48,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # The binary is behind the `cli` feature. Without it cargo install builds
+      # the library, installs nothing, and still exits 0; --version catches that.
       - name: Install cargo-about
-        run: cargo install --locked cargo-about@0.9.2
+        run: |
+          cargo install --locked cargo-about@0.9.2 --features cli
+          cargo about --version
 
       - name: Check THIRD_PARTY_LICENSES.md
         run: scripts/licenses.sh --check

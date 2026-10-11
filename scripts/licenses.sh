@@ -8,7 +8,7 @@
 #
 # Generated offline (--frozen), from the license files each crate packages, so
 # the same Cargo.lock always gives the same file. Needs cargo-about:
-# `brew install cargo-about` or `cargo install --locked cargo-about`.
+# `brew install cargo-about` or `cargo install --locked cargo-about --features cli`.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -17,7 +17,7 @@ OUT=THIRD_PARTY_LICENSES.md
 die() { printf '%s\n' "error: $*" >&2; exit 1; }
 
 command -v cargo-about >/dev/null 2>&1 \
-  || die "cargo-about is required: brew install cargo-about, or cargo install --locked cargo-about"
+  || die "cargo-about is required: brew install cargo-about, or cargo install --locked cargo-about --features cli"
 
 generate() {
   cargo about generate --frozen --all-features --fail about.hbs

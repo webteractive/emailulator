@@ -1051,7 +1051,7 @@ function renderList() {
       : state.view.kind === 'starred'
         ? 'No starred messages. Press s on a message to star it.'
         : state.view.kind === 'inbox'
-          ? 'Nothing has been delivered to this inbox yet.'
+          ? 'Nothing has been delivered to this inbox yet. Connect, above, shows how to point an app at it.'
           : 'No messages yet.';
   }
 
@@ -1970,8 +1970,15 @@ function renderWelcome() {
 let welcomeFor = null;
 
 function renderEmptiness() {
-  // The welcome stands in for an empty list, but never for an open panel.
-  const fresh = state.statsLoaded && state.stats.total === 0 && !state.query && !state.panel;
+  // The welcome stands in for an empty server's home view. An inbox someone
+  // opened keeps the list and its header, where Connect is, even while it is
+  // empty; and it never stands in for an open panel.
+  const fresh =
+    state.statsLoaded &&
+    state.stats.total === 0 &&
+    !state.query &&
+    !state.panel &&
+    state.view.kind !== 'inbox';
   const main = $('main');
   const key = fresh ? viewKey(state.view) : null;
   if (fresh === main.classList.contains('is-fresh') && key === welcomeFor) return;

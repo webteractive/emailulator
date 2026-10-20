@@ -189,6 +189,26 @@ same servers and store as `emailulator run`. If ports 1025 and 8025 are taken it
 moves to 1026 and 8026 (then 2525 and 8525) and shows which. It is a local tool:
 it does not connect to a remote server.
 
+## Keep it running on a Mac
+
+`emailulator service install` runs `emailulator run` as a LaunchAgent: it starts
+at login, starts again whenever it stops, and needs nothing left open.
+`self-update --restart` brings it back on the new binary. Options for `run` go
+after `--`:
+
+```sh
+emailulator service install -- --max-messages 5000
+emailulator service status     # --json for scripts; exits 0 answering, 3 not, 4 not installed
+emailulator service uninstall  # messages and the log stay
+```
+
+While it runs it is the one server on the Mac: `emailulator app` opens its
+window on the agent's web UI instead of starting servers of its own, and
+`emailulator run` refuses to start a second one. The agent does not see your
+shell's environment, so pass what it needs as options; it will not take
+`--auth-token` or `--provision`, whose values would show in the process list
+(use `--auth-token-file`). It logs to `~/Library/Logs/emailulator/server.log`.
+
 ## Deploying
 
 Away from `127.0.0.1`:

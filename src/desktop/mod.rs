@@ -3,6 +3,10 @@
 //! app, bound to this machine only, and shows what the HTTP server serves in
 //! the system webview, so the app and the browser are one interface.
 //!
+//! While the LaunchAgent from `emailulator service install` runs, the app
+//! starts no servers: its window shows the agent's web UI instead, so there is
+//! one server on the machine.
+//!
 //! Compiled in with the `desktop` feature, for macOS and Windows. It is left
 //! out of the Linux server build because the webview links the windowing
 //! system, and a binary that does so cannot start on a headless host that
@@ -39,6 +43,10 @@ const FALLBACK_PORTS: &[(u16, u16)] = &[(1026, 8026), (2525, 8525), (2526, 8526)
 /// How long the self-test waits for the web UI to show a message.
 const SELFTEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long to wait for a running LaunchAgent to answer, as one launchd has
+/// only just started does, before the app starts servers of its own.
+const AGENT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The configurations to try, first to last. Addresses the user asked for are
 /// used as given or not at all; only the defaults fall back.
 fn candidates(options: Options) -> Vec<Config> {
@@ -63,9 +71,19 @@ fn candidates(options: Options) -> Vec<Config> {
     configs
 }
 
+/// The web UI to show: the running LaunchAgent's, or that of servers started
+/// here. The self-test always starts its own, on the store it was given, so
+/// that it never delivers into the agent's.
+fn start(options: Options, selftest: bool) -> anyhow::Result<String> {
+    if !selftest && let Some(agent) = crate::service::serving(AGENT_TIMEOUT) {
+        return Ok(agent.origin());
+    }
+    start_servers(options).map(|addr| format!("http://{addr}/"))
+}
+
 /// Start the servers on their own thread and runtime; the window owns the main
 /// one. Returns the address the HTTP server answers on.
-fn start(options: Options) -> anyhow::Result<SocketAddr> {
+fn start_servers(options: Options) -> anyhow::Result<SocketAddr> {
     let candidates = candidates(options);
     let (ready, started) = mpsc::channel();
     std::thread::Builder::new()
@@ -307,7 +325,7 @@ fn menus() -> anyhow::Result<Menus> {
 
 fn webview(
     window: &tao::window::Window,
-    started: &anyhow::Result<SocketAddr>,
+    started: &anyhow::Result<String>,
     proxy: &EventLoopProxy<UserEvent>,
     selftest: bool,
 ) -> anyhow::Result<WebView> {
@@ -317,15 +335,14 @@ fn webview(
         // Downloads, under a name that never overwrites a file.
         .with_download_started_handler(|_url, _destination| true);
 
-    let addr = match started {
-        Ok(addr) => *addr,
+    let origin = match started {
+        Ok(origin) => origin.clone(),
         Err(error) => {
             return Ok(builder
                 .with_html(failure_page(&format!("{error:#}")))
                 .build(window)?);
         }
     };
-    let origin = format!("http://{addr}/");
 
     // The web UI may load only its own pages. That holds for the frame an
     // email is shown in too, so a meta refresh in an email goes nowhere.
@@ -364,8 +381,8 @@ fn webview(
 /// Run the app. Must be called on the main thread, which it keeps until the
 /// window closes.
 pub fn run(options: Options) {
-    let started = start(options);
     let selftest = std::env::var_os("EMAILULATOR_APP_SELFTEST").is_some();
+    let started = start(options, selftest);
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -411,7 +428,7 @@ pub fn run(options: Options) {
             eprintln!("emailulator: could not attach the menu bar: {error}");
         }
     }
-    let web_ui = started.as_ref().ok().map(|addr| format!("http://{addr}/"));
+    let web_ui = started.as_ref().ok().cloned();
     let deadline = Instant::now() + SELFTEST_TIMEOUT;
     if selftest && let Err(error) = &started {
         eprintln!("emailulator: self-test failed: {error:#}");

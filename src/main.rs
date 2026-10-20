@@ -1,7 +1,8 @@
 #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
 mod desktop;
+mod service;
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -57,6 +58,16 @@ enum Command {
     /// Create, list and revoke the API keys of an inbox
     #[command(subcommand)]
     Key(KeyCommand),
+    /// Keep `emailulator run` running in the background on macOS, as a LaunchAgent
+    #[command(
+        subcommand,
+        long_about = "Keep `emailulator run` running in the background on macOS, as a \
+            LaunchAgent: it starts at login, starts again whenever it stops, and needs nothing \
+            left open. `self-update --restart` restarts it on the new binary.\n\n\
+            While it runs it is the one server on this Mac: `emailulator app` opens its window \
+            on the agent's web UI, and `emailulator run` refuses to start a second server."
+    )]
+    Service(ServiceCommand),
     /// Serve MCP over stdio, reading the message store on this machine
     Mcp(McpArgs),
     /// Print a new random auth token
@@ -86,6 +97,27 @@ struct SelfUpdateArgs {
     /// After updating, stop this user's running `emailulator run` so its supervisor starts the new binary
     #[arg(long)]
     restart: bool,
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Install the LaunchAgent and start it, replacing one already installed
+    #[command(after_help = "Example:\n  emailulator service install -- --max-messages 5000")]
+    Install {
+        /// Options for `emailulator run`, after `--`. Not --auth-token or --provision,
+        /// which would show their secrets in the process list
+        #[arg(last = true, value_name = "RUN OPTIONS")]
+        run: Vec<String>,
+    },
+    /// Stop the LaunchAgent and remove it; messages and logs stay
+    Uninstall,
+    /// Show whether the LaunchAgent is installed, running and answering.
+    /// Exits 0 when it answers, 3 when it is installed but does not, 4 when it is not installed
+    Status {
+        /// Print JSON, for scripts and agents
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -447,10 +479,13 @@ impl RunArgs {
 }
 
 fn init_logging(level: tracing::Level) {
+    use std::io::IsTerminal;
     // Logs go to stderr so stdout stays clean for the stdio MCP transport.
+    // Colour only for a terminal: the LaunchAgent's goes to a log file.
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .with_target(false)
         .init();
 }
@@ -479,6 +514,7 @@ async fn shutdown_signal() {
 }
 
 async fn serve(args: RunArgs) -> Result<()> {
+    service::refuse_a_second_server()?;
     init_logging(args.log_level);
     let config = args.into_config()?;
     let data = match &config.data_dir {
@@ -790,21 +826,12 @@ fn open_app(_args: AppArgs) -> Result<()> {
     )
 }
 
-/// A wildcard listen address is not one a client can connect to.
-fn reachable(addr: SocketAddr) -> SocketAddr {
-    if addr.ip().is_unspecified() {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
-    } else {
-        addr
-    }
-}
-
 async fn healthcheck(args: HealthArgs) -> Result<()> {
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpStream;
 
     let check = async {
-        let smtp = reachable(args.smtp_addr);
+        let smtp = service::reachable(args.smtp_addr);
         let mut stream = TcpStream::connect(smtp)
             .await
             .with_context(|| format!("SMTP is not answering on {smtp}"))?;
@@ -816,7 +843,7 @@ async fn healthcheck(args: HealthArgs) -> Result<()> {
         if &greeting != b"220" {
             bail!("SMTP on {smtp} greeted with something other than 220");
         }
-        let http = reachable(args.http_addr);
+        let http = service::reachable(args.http_addr);
         TcpStream::connect(http)
             .await
             .with_context(|| format!("HTTP is not answering on {http}"))?;
@@ -844,6 +871,31 @@ async fn run(command: Command) -> Result<()> {
             Ok(())
         }
         Command::SelfUpdate(args) => self_update(args),
+        Command::Service(command) => service_command(command).map(|_| ()),
+    }
+}
+
+fn service_command(command: ServiceCommand) -> Result<ExitCode> {
+    match command {
+        ServiceCommand::Install { run } => {
+            // Parsed here as `run` would parse them, so that a mistake is
+            // reported now rather than by an agent that fails at every start.
+            let argv = ["emailulator", "run"].into_iter().map(String::from);
+            Cli::try_parse_from(argv.chain(run.iter().cloned())).map_err(|error| {
+                anyhow!(
+                    "these are not options `emailulator run` takes:\n{}",
+                    error
+                        .render()
+                        .to_string()
+                        .trim_start_matches("error: ")
+                        .trim_end()
+                )
+            })?;
+            service::install(&run)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        ServiceCommand::Uninstall => service::uninstall().map(|()| ExitCode::SUCCESS),
+        ServiceCommand::Status { json } => service::status(json),
     }
 }
 
@@ -881,15 +933,18 @@ fn main() -> ExitCode {
     let result = match cli.command {
         // The app needs the main thread for its window, and runs the servers
         // on a runtime of its own.
-        Command::App(args) => open_app(args),
+        Command::App(args) => open_app(args).map(|()| ExitCode::SUCCESS),
+        // Its status answers with an exit code of its own.
+        Command::Service(command) => service_command(command),
         command => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .context("starting the async runtime")
-            .and_then(|runtime| runtime.block_on(run(command))),
+            .and_then(|runtime| runtime.block_on(run(command)))
+            .map(|()| ExitCode::SUCCESS),
     };
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             eprintln!("error: {error:#}");
             ExitCode::FAILURE

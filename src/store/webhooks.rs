@@ -16,7 +16,9 @@ use crate::parse;
 use crate::security::{generate_public_id, generate_webhook_secret};
 use crate::webhook::{self, Detail, Email};
 
-/// Deliveries kept once they are done; the oldest beyond this are dropped.
+/// Deliveries each webhook keeps once they are done; the oldest beyond this
+/// are dropped. Counted per webhook, so one inbox's traffic, which an inbox
+/// key can make with simulated events, never clears another's log.
 const MAX_DELIVERIES: i64 = 1000;
 /// Deliveries a webhook may have waiting; beyond this the oldest are given up,
 /// so an endpoint that is down cannot grow the queue without end.
@@ -193,12 +195,13 @@ pub(super) fn enqueue(
                  AND status = 'pending' ORDER BY seq DESC LIMIT ?2)",
                 params![id, MAX_PENDING],
             )?;
+            conn.execute(
+                "DELETE FROM webhook_deliveries WHERE webhook = ?1 AND status <> 'pending' \
+                 AND seq NOT IN (SELECT seq FROM webhook_deliveries WHERE webhook = ?1 \
+                 AND status <> 'pending' ORDER BY seq DESC LIMIT ?2)",
+                params![id, MAX_DELIVERIES],
+            )?;
         }
-        conn.execute(
-            "DELETE FROM webhook_deliveries WHERE status <> 'pending' AND seq NOT IN \
-             (SELECT seq FROM webhook_deliveries ORDER BY seq DESC LIMIT ?)",
-            [MAX_DELIVERIES],
-        )?;
     }
     Ok(queued)
 }
@@ -653,17 +656,71 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(count("pending"), MAX_PENDING);
-        // The oldest, the first mail's sent and delivered, were given up and,
-        // being done, pruned.
-        let waiting: Vec<String> = store
+        let given_up: Vec<String> = store
             .conn()
-            .prepare("SELECT DISTINCT type FROM webhook_deliveries")
+            .prepare(
+                "SELECT type FROM webhook_deliveries WHERE status = 'failed' \
+                 AND last_error LIKE 'given up%' ORDER BY seq",
+            )
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(waiting, ["email.opened"]);
+        assert_eq!(given_up, ["email.sent", "email.delivered"], "the oldest");
+    }
+
+    #[test]
+    fn one_inbox_cannot_clear_anothers_delivery_log() {
+        let (store, _) = hooked();
+        deliver(&store, "user@x.test");
+        for delivery in store.claim_due_deliveries(now_ms(), 10).unwrap() {
+            let answer = Attempt::Answered {
+                status: 200,
+                body: String::new(),
+            };
+            store.record_attempt(&delivery.id, &answer).unwrap();
+        }
+
+        let (other, _) = store
+            .create_inbox_named(crate::store::NewInbox {
+                name: "Billing".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .create_webhook(NewWebhook {
+                inbox: other.id.clone(),
+                endpoint: "http://127.0.0.1:9/hook".into(),
+                events: vec![],
+                verify_tls: true,
+            })
+            .unwrap();
+        let id = store
+            .insert(Incoming {
+                raw: b"From: a@x.test\r\nTo: b@x.test\r\nSubject: Hi\r\n\r\nbody\r\n".to_vec(),
+                inbox: other.id.clone(),
+                envelope_from: None,
+                envelope_to: vec![],
+                source: Source::Api,
+                tags: BTreeMap::new(),
+            })
+            .unwrap()
+            .id;
+        for _ in 0..MAX_DELIVERIES {
+            store
+                .simulate_event(id, "email.opened", &Detail::default())
+                .unwrap();
+        }
+
+        let kept = store
+            .deliveries(&DeliveryFilter {
+                inbox: Some(DEFAULT_INBOX.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().all(|d| d.status == "succeeded"));
     }
 
     #[test]

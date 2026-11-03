@@ -2,7 +2,7 @@
 //! per connection. Webhooks are rare and each goes out on its own, so there is
 //! no pool to keep.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -61,30 +61,63 @@ pub async fn post(post: Post<'_>, policy: Policy) -> Result<Answer> {
         .map_err(|_| anyhow!("no answer within {} seconds", TIMEOUT.as_secs()))?
 }
 
-/// Whether an address is one anybody may reach: not this machine, not a
-/// private or link-local network, not an unspecified or broadcast address.
+/// IPv4 ranges that are not the public internet: IANA's special-purpose
+/// registry, so anything not on it is a routable address.
+const SPECIAL_V4: &[([u8; 4], u8)] = &[
+    ([0, 0, 0, 0], 8),       // "this network"
+    ([10, 0, 0, 0], 8),      // private
+    ([100, 64, 0, 0], 10),   // carrier-grade NAT and Tailscale
+    ([127, 0, 0, 0], 8),     // loopback
+    ([169, 254, 0, 0], 16),  // link-local, and cloud metadata
+    ([172, 16, 0, 0], 12),   // private
+    ([192, 0, 0, 0], 24),    // protocol assignments
+    ([192, 0, 2, 0], 24),    // documentation
+    ([192, 88, 99, 0], 24),  // 6to4 relays
+    ([192, 168, 0, 0], 16),  // private
+    ([198, 18, 0, 0], 15),   // benchmarking
+    ([198, 51, 100, 0], 24), // documentation
+    ([203, 0, 113, 0], 24),  // documentation
+    ([224, 0, 0, 0], 4),     // multicast
+    ([240, 0, 0, 0], 4),     // reserved, and broadcast
+];
+
+/// Whether an address is one anybody may reach. Anything not known to be
+/// public is refused: IPv6 must be global unicast, and an address that
+/// carries an IPv4 one, as mapped, NAT64 and 6to4 addresses do, is judged by
+/// that.
 fn public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
-            !(v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                // Shared address space, used by carrier-grade NAT and Tailscale.
-                || (a == 100 && (64..128).contains(&b)))
+            let ip = u32::from(v4);
+            !SPECIAL_V4.iter().any(|&(network, bits)| {
+                let mask = u32::MAX << (32 - u32::from(bits));
+                ip & mask == u32::from(Ipv4Addr::from(network))
+            })
         }
         IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return public(IpAddr::V4(v4));
             }
-            let first = v6.segments()[0];
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                // Unique local, fc00::/7, and link-local, fe80::/10.
-                || (first & 0xfe00) == 0xfc00
-                || (first & 0xffc0) == 0xfe80)
+            let s = v6.segments();
+            let embedded = |high: u16, low: u16| {
+                public(IpAddr::V4(Ipv4Addr::from(
+                    (u32::from(high) << 16) | u32::from(low),
+                )))
+            };
+            match s {
+                // NAT64, which a resolver may hand out for an IPv4-only host.
+                [0x64, 0xff9b, 0, 0, 0, 0, high, low] => embedded(high, low),
+                // 6to4: the IPv4 address follows the prefix.
+                [0x2002, high, low, ..] => embedded(high, low),
+                // Protocol assignments, Teredo among them, whose client
+                // address is hidden; and documentation.
+                [0x2001, second, ..] if second < 0x200 => false,
+                [0x2001, 0xdb8, ..] => false,
+                [first, ..] if first & 0xfff0 == 0x3ff0 => false,
+                // Global unicast is 2000::/3; the rest is local, multicast,
+                // or reserved.
+                [first, ..] => first & 0xe000 == 0x2000,
+            }
         }
     }
 }
@@ -283,10 +316,30 @@ mod tests {
             "fd00::1",
             "fe80::1",
             "::ffff:127.0.0.1",
+            "0.1.2.3",
+            "192.0.0.170",
+            "198.18.0.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::127.0.0.1",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1::1",
+            "2002:7f00:1::",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "2001:db8::1",
+            "ff02::1",
+            "100::1",
         ] {
             assert!(!public(private.parse().unwrap()), "{private}");
         }
-        for open in ["1.1.1.1", "93.184.216.34", "2606:4700::1111"] {
+        for open in [
+            "1.1.1.1",
+            "93.184.216.34",
+            "2606:4700::1111",
+            "64:ff9b::101:101",
+            "2002:101:101::1",
+        ] {
             assert!(public(open.parse().unwrap()), "{open}");
         }
     }

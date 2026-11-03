@@ -262,7 +262,8 @@ certificates; add the webhook with `--insecure`, or tick *Accept any TLS certifi
 the web UI, for a self-signed one. A server with an admin token, or one
 reachable from other machines, posts only to public addresses unless started
 with `--allow-private-webhooks`. A webhook holds at most 1,000 deliveries
-waiting to be sent; beyond that the oldest are marked failed.
+waiting to be sent, beyond which the oldest are marked failed, and keeps its
+latest 1,000 finished ones in the log.
 
 ## Desktop app
 
@@ -394,10 +395,12 @@ whoever sends it. The design assumes both.
 - **It never relays**, and size, recipients, connections, message count and
   storage are all capped.
 - **Webhooks stay off the local network** unless the server is yours alone:
-  with an admin token or an exposed HTTP listener, endpoints on this machine,
-  private or link-local addresses are refused, and the address checked is the
-  one connected to. A loopback server with no token, or
-  `--allow-private-webhooks`, allows them. Only the admin adds webhooks.
+  with an admin token or an exposed HTTP listener, only public addresses are
+  posted to. This machine, private, link-local and other special-purpose
+  addresses are refused, including those carried inside NAT64 and 6to4
+  addresses, and the address checked is the one connected to. A loopback
+  server with no token, or `--allow-private-webhooks`, allows them. Only the
+  admin adds webhooks.
 
 The database is created `0600` in a `0700` directory, unencrypted.
 

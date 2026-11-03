@@ -30,7 +30,11 @@ use crate::compose::SendRequest;
 use crate::mcp::{Liveness, Mcp};
 use crate::model::{Event, ListFilter, Source};
 use crate::security::{Access, Auth, Credential, InboxKey, Session, hash_api_key};
-use crate::store::{DEFAULT_INBOX, InboxError, Incoming, Store};
+use crate::store::{
+    DEFAULT_INBOX, DeliveryFilter, InboxError, Incoming, NewWebhook, Store, WebhookChanges,
+    WebhookError,
+};
+use crate::webhook::Detail;
 
 const SESSION_COOKIE: &str = "emailulator_session";
 const LOGIN_FAILURE_DELAY: Duration = Duration::from_millis(750);
@@ -83,6 +87,8 @@ pub struct HttpConfig {
     pub ui: bool,
     /// The listener is reachable from this machine only.
     pub loopback: bool,
+    /// SpamAssassin's spamd, as `host:port`, for a spam score in the check.
+    pub spamassassin: Option<String>,
 }
 
 struct AppState {
@@ -141,6 +147,13 @@ impl From<anyhow::Error> for ApiError {
             };
             return Self::new(status, refused.to_string());
         }
+        if let Some(refused) = error.downcast_ref::<WebhookError>() {
+            let status = match refused {
+                WebhookError::Invalid(_) => StatusCode::BAD_REQUEST,
+                WebhookError::NotFound(_) => StatusCode::NOT_FOUND,
+            };
+            return Self::new(status, refused.to_string());
+        }
         // Anything else is ours; the cause goes to the log, not to the caller.
         tracing::error!(%error, "request failed");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
@@ -165,7 +178,7 @@ where
 pub fn router(store: Arc<Store>, config: HttpConfig) -> Router {
     let max_message_size = config.info.max_message_size;
     let state: Shared = Arc::new(AppState {
-        mcp: Mcp::new(store.clone(), max_message_size),
+        mcp: Mcp::new(store.clone(), max_message_size, config.spamassassin.clone()),
         store,
         config,
     });
@@ -213,6 +226,16 @@ pub fn router(store: Arc<Store>, config: HttpConfig) -> Router {
             "/api/v1/messages/{id}/attachments/{index}",
             get(message_attachment),
         )
+        .route("/api/v1/messages/{id}/events", post(simulate_event))
+        .route("/api/v1/webhooks", get(list_webhooks).post(create_webhook))
+        .route(
+            "/api/v1/webhooks/{id}",
+            get(get_webhook)
+                .patch(update_webhook)
+                .delete(delete_webhook),
+        )
+        .route("/api/v1/deliveries", get(list_deliveries))
+        .route("/api/v1/deliveries/{id}/replay", post(replay_delivery))
         .route("/mcp", post(mcp));
 
     if state.config.ui {
@@ -488,6 +511,17 @@ async fn scope(
             }
         }
     }
+}
+
+/// The row id of the message a path names, by its row id or its `em_` id,
+/// refused as [`authorize`] refuses one outside the caller's inbox.
+async fn message_in_reach(state: &Shared, access: &Access, text: &str) -> ApiResult<i64> {
+    let wanted = text.to_string();
+    let Some(id) = store(state, move |s| s.message_ref(&wanted)).await? else {
+        return Err(ApiError::not_found(format_args!("message {text}")));
+    };
+    authorize(state, access, id).await?;
+    Ok(id)
 }
 
 /// Refuse a message outside the caller's inbox, in the same words as a message
@@ -888,9 +922,16 @@ async fn send_message(
                 })
                 .unwrap_or_default(),
             source: Source::Api,
+            tags: Default::default(),
         }
     };
 
+    let summary = deliver(&state, incoming).await?;
+    Ok((StatusCode::CREATED, Json(summary)).into_response())
+}
+
+/// Store a message that came in over HTTP.
+async fn deliver(state: &Shared, incoming: Incoming) -> ApiResult<crate::model::MessageSummary> {
     if incoming.raw.len() > state.config.info.max_message_size {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -900,8 +941,7 @@ async fn send_message(
             ),
         ));
     }
-
-    let summary = store(&state, move |s| s.insert(incoming)).await?;
+    let summary = store(state, move |s| s.insert(incoming)).await?;
     tracing::info!(
         id = summary.id,
         inbox = %summary.inbox,
@@ -909,7 +949,209 @@ async fn send_message(
         size = summary.size,
         "message received over the API"
     );
-    Ok((StatusCode::CREATED, Json(summary)).into_response())
+    Ok(summary)
+}
+
+// ---------------------------------------------------------------------------
+// Webhooks
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct WebhookQuery {
+    inbox: Option<String>,
+}
+
+async fn list_webhooks(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Query(query): Query<WebhookQuery>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&access)?;
+    let inbox = scope(&state, &access, query.inbox).await?;
+    let webhooks = store(&state, move |s| s.webhooks(inbox.as_deref())).await?;
+    Ok(Json(json!({"webhooks": webhooks})))
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewWebhookBody {
+    /// The default inbox when left out.
+    inbox: Option<String>,
+    endpoint: String,
+    /// Event types, or `all`; all when left out.
+    #[serde(default)]
+    events: Vec<String>,
+    #[serde(default = "yes")]
+    verify_tls: bool,
+}
+
+/// Add a webhook. Its signing secret is in the answer, and stays readable.
+async fn create_webhook(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Json(body): Json<NewWebhookBody>,
+) -> ApiResult<Response> {
+    require_admin(&access)?;
+    let inbox = scope(&state, &access, body.inbox)
+        .await?
+        .unwrap_or_else(|| DEFAULT_INBOX.to_string());
+    let new = NewWebhook {
+        inbox,
+        endpoint: body.endpoint,
+        events: body.events,
+        verify_tls: body.verify_tls,
+    };
+    let hook = store(&state, move |s| s.create_webhook(new)).await?;
+    tracing::info!(webhook = %hook.id, inbox = %hook.inbox, endpoint = %hook.endpoint, "webhook created");
+    Ok((StatusCode::CREATED, Json(json!(hook))).into_response())
+}
+
+async fn get_webhook(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&access)?;
+    let wanted = id.clone();
+    let hook = store(&state, move |s| s.webhook(&wanted))
+        .await?
+        .ok_or_else(|| ApiError::not_found(format_args!("webhook {id}")))?;
+    Ok(Json(json!(hook)))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebhookPatch {
+    endpoint: Option<String>,
+    events: Option<Vec<String>>,
+    enabled: Option<bool>,
+    verify_tls: Option<bool>,
+}
+
+async fn update_webhook(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(id): Path<String>,
+    Json(patch): Json<WebhookPatch>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&access)?;
+    let changes = WebhookChanges {
+        endpoint: patch.endpoint,
+        events: patch.events,
+        enabled: patch.enabled,
+        verify_tls: patch.verify_tls,
+    };
+    let hook = store(&state, move |s| s.update_webhook(&id, changes)).await?;
+    Ok(Json(json!(hook)))
+}
+
+async fn delete_webhook(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    require_admin(&access)?;
+    let wanted = id.clone();
+    if !store(&state, move |s| s.delete_webhook(&wanted)).await? {
+        return Err(ApiError::not_found(format_args!("webhook {id}")));
+    }
+    tracing::info!(webhook = %id, "webhook deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliveryQuery {
+    inbox: Option<String>,
+    webhook: Option<String>,
+    /// A message, by its row id or `em_` id.
+    message: Option<String>,
+    limit: Option<usize>,
+}
+
+/// The delivery log, newest first. A key sees its own inbox's.
+async fn list_deliveries(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Query(query): Query<DeliveryQuery>,
+) -> ApiResult<Json<Value>> {
+    let inbox = scope(&state, &access, query.inbox).await?;
+    let email_id = match query.message {
+        Some(text) => {
+            let id = message_in_reach(&state, &access, &text).await?;
+            let summary = store(&state, move |s| s.summary(id)).await?;
+            summary.map(|m| m.email_id)
+        }
+        None => None,
+    };
+    let filter = DeliveryFilter {
+        inbox,
+        webhook: query.webhook,
+        email_id,
+        limit: query.limit,
+    };
+    let deliveries = store(&state, move |s| s.deliveries(&filter)).await?;
+    Ok(Json(json!({"deliveries": deliveries})))
+}
+
+/// Send a delivery again, with the same body and `webhook-id`.
+async fn replay_delivery(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let wanted = id.clone();
+    let found = store(&state, move |s| s.delivery(&wanted)).await?;
+    let reachable = match (&found, &access) {
+        (Some(delivery), Access::Inbox(own)) => delivery.inbox == *own,
+        (Some(_), Access::Admin) => true,
+        (None, _) => false,
+    };
+    if !reachable {
+        return Err(ApiError::not_found(format_args!("delivery {id}")));
+    }
+    let wanted = id.clone();
+    let delivery = store(&state, move |s| {
+        s.replay_delivery(&wanted)?;
+        s.delivery(&wanted)
+    })
+    .await?
+    .ok_or_else(|| ApiError::not_found(format_args!("delivery {id}")))?;
+    Ok(Json(json!(delivery)))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SimulatedEvent {
+    #[serde(rename = "type")]
+    event: String,
+    /// For `email.clicked`: the link to report; the message's first otherwise.
+    link: Option<String>,
+}
+
+/// Report an event about a message to its inbox's webhooks, such as a bounce
+/// or a click that a real provider would have seen.
+async fn simulate_event(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(id): Path<String>,
+    Json(body): Json<SimulatedEvent>,
+) -> ApiResult<Response> {
+    let id = message_in_reach(&state, &access, &id).await?;
+    let detail = Detail { link: body.link };
+    let event = body.event.clone();
+    let queued = store(&state, move |s| s.simulate_event(id, &event, &detail)).await?;
+    let mut answer = json!({"type": body.event, "queued": queued});
+    if queued == 0 {
+        answer["note"] = json!(
+            "no enabled webhook of this message's inbox takes this event, so nothing was sent"
+        );
+    }
+    Ok((StatusCode::ACCEPTED, Json(answer)).into_response())
 }
 
 #[derive(Deserialize)]
@@ -950,9 +1192,9 @@ async fn delete_messages(
 async fn get_message(
     State(state): State<Shared>,
     Extension(access): Extension<Access>,
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    authorize(&state, &access, id).await?;
+    let id = message_in_reach(&state, &access, &id).await?;
     let detail = store(&state, move |s| s.get(id))
         .await?
         .ok_or_else(|| ApiError::not_found(format_args!("message {id}")))?;
@@ -962,13 +1204,13 @@ async fn get_message(
 async fn update_message(
     State(state): State<Shared>,
     Extension(access): Extension<Access>,
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
     Json(flags): Json<Flags>,
 ) -> ApiResult<Json<Value>> {
     if flags.read.is_none() && flags.starred.is_none() {
         return Err(ApiError::bad_request("give `read`, `starred`, or both"));
     }
-    authorize(&state, &access, id).await?;
+    let id = message_in_reach(&state, &access, &id).await?;
     let summary = store(&state, move |s| {
         s.set_flags(id, flags.read, flags.starred)?;
         s.summary(id)
@@ -981,9 +1223,9 @@ async fn update_message(
 async fn delete_message(
     State(state): State<Shared>,
     Extension(access): Extension<Access>,
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    authorize(&state, &access, id).await?;
+    let id = message_in_reach(&state, &access, &id).await?;
     if store(&state, move |s| s.delete(id)).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -1023,9 +1265,9 @@ fn attachment_disposition(filename: &str) -> HeaderValue {
 async fn message_raw(
     State(state): State<Shared>,
     Extension(access): Extension<Access>,
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    authorize(&state, &access, id).await?;
+    let id = message_in_reach(&state, &access, &id).await?;
     let raw = store(&state, move |s| s.raw(id))
         .await?
         .ok_or_else(|| ApiError::not_found(format_args!("message {id}")))?;
@@ -1058,9 +1300,9 @@ fn escape_html(text: &str) -> String {
 async fn message_html(
     State(state): State<Shared>,
     Extension(access): Extension<Access>,
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    authorize(&state, &access, id).await?;
+    let id = message_in_reach(&state, &access, &id).await?;
     let html = match store(&state, move |s| s.rendered_html(id)).await? {
         Some(html) => html,
         // No HTML part: show the text the way a mail client would.
@@ -1097,9 +1339,9 @@ async fn message_html(
 async fn message_links(
     State(state): State<Shared>,
     Extension(access): Extension<Access>,
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    authorize(&state, &access, id).await?;
+    let id = message_in_reach(&state, &access, &id).await?;
     let links = store(&state, move |s| s.links(id))
         .await?
         .ok_or_else(|| ApiError::not_found(format_args!("message {id}")))?;
@@ -1116,10 +1358,10 @@ struct CheckQuery {
 async fn message_check(
     State(state): State<Shared>,
     Extension(access): Extension<Access>,
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
     Query(query): Query<CheckQuery>,
 ) -> ApiResult<Json<Value>> {
-    authorize(&state, &access, id).await?;
+    let id = message_in_reach(&state, &access, &id).await?;
     let only: Option<Vec<String>> = query.clients.map(|clients| {
         clients
             .split(',')
@@ -1127,21 +1369,29 @@ async fn message_check(
             .filter(|c| !c.is_empty())
             .collect()
     });
-    let report = store(&state, move |s| {
-        Ok(s.get(id)?
-            .map(|detail| crate::check::check(&detail, only.as_deref())))
+    let (mut report, raw) = store(&state, move |s| {
+        let Some(detail) = s.get(id)? else {
+            return Ok(None);
+        };
+        let raw = s.raw(id)?.unwrap_or_default();
+        let mut report = crate::check::check(&detail, only.as_deref());
+        report.deliverability = crate::deliverability::check(&detail, &raw);
+        Ok(Some((report, raw)))
     })
     .await?
     .ok_or_else(|| ApiError::not_found(format_args!("message {id}")))?;
+    if let Some(spamd) = &state.config.spamassassin {
+        report.spam = Some(crate::deliverability::spamassassin(spamd, &raw).await);
+    }
     Ok(Json(json!(report)))
 }
 
 async fn message_attachment(
     State(state): State<Shared>,
     Extension(access): Extension<Access>,
-    Path((id, index)): Path<(i64, usize)>,
+    Path((id, index)): Path<(String, usize)>,
 ) -> ApiResult<Response> {
-    authorize(&state, &access, id).await?;
+    let id = message_in_reach(&state, &access, &id).await?;
     let (meta, bytes) = store(&state, move |s| s.attachment(id, index))
         .await?
         .ok_or_else(|| ApiError::not_found(format_args!("attachment {index} of message {id}")))?;
@@ -1432,6 +1682,7 @@ mod tests {
             },
             ui: true,
             loopback,
+            spamassassin: None,
         };
         (router(store.clone(), config), store)
     }
@@ -2108,6 +2359,7 @@ mod tests {
                     envelope_from: None,
                     envelope_to: Vec::new(),
                     source: Source::Api,
+                    tags: Default::default(),
                 })
                 .unwrap();
         };
@@ -2273,6 +2525,12 @@ mod tests {
         assert!(report["features_found"].as_u64().unwrap() >= 1, "{report}");
         assert_eq!(report["clients"][0]["family"], "gmail");
         assert!(report["data_updated"].as_str().unwrap().len() == 10);
+        let findings = report["deliverability"].as_array().unwrap();
+        assert!(
+            findings.iter().any(|f| f["code"] == "dkim-missing"),
+            "{report}"
+        );
+        assert!(report["spam"].is_null(), "no SpamAssassin is configured");
 
         let (_, narrowed) = json(
             &app,
@@ -2376,5 +2634,185 @@ mod tests {
             value.contains("filename*=UTF-8''a%22b%0D%0AX%3A%20y%2F..%2F%C3%A9.pdf"),
             "{value}"
         );
+    }
+
+    fn billing(store: &Store) -> (String, String) {
+        let (inbox, key) = store
+            .create_inbox_named(crate::store::NewInbox {
+                name: "Billing".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        (inbox.id, key)
+    }
+
+    #[tokio::test]
+    async fn webhooks_are_the_admins_and_events_reach_them() {
+        let (app, store) = app(Some(TOKEN), true);
+        let (inbox, key) = billing(&store);
+
+        let new = json!({"inbox": inbox, "endpoint": "http://127.0.0.1:9/hook", "events": ["email.delivered", "email.clicked"]});
+        let (status, _) = json(
+            &app,
+            json_request(with_key("POST", "/api/v1/webhooks", &key), new.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "keys cannot add webhooks");
+        let (status, hook) = json(
+            &app,
+            json_request(with_key("POST", "/api/v1/webhooks", TOKEN), new),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{hook}");
+        let hook_id = hook["id"].as_str().unwrap().to_string();
+        assert!(hook["secret"].as_str().unwrap().starts_with("whsec_"));
+
+        let bad = json!({"endpoint": "ftp://x.test", "inbox": inbox});
+        let (status, _) = json(
+            &app,
+            json_request(with_key("POST", "/api/v1/webhooks", TOKEN), bad),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (_, list) = json(
+            &app,
+            empty(with_key(
+                "GET",
+                &format!("/api/v1/webhooks?inbox={inbox}"),
+                TOKEN,
+            )),
+        )
+        .await;
+        assert_eq!(list["webhooks"].as_array().unwrap().len(), 1);
+
+        // Mail arriving queues what the webhook asked for.
+        let id = seed(&app, "/api/v1/messages", Some(&key)).await;
+        let (_, log) = json(&app, empty(with_key("GET", "/api/v1/deliveries", &key))).await;
+        let types: Vec<_> = log["deliveries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["type"].clone())
+            .collect();
+        assert_eq!(types, [json!("email.delivered")]);
+
+        // A key may simulate events on its own mail.
+        let click = json!({"type": "email.clicked", "link": "https://x.test/go"});
+        let (status, body) = json(
+            &app,
+            json_request(
+                with_key("POST", &format!("/api/v1/messages/{id}/events"), &key),
+                click,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body["queued"], 1);
+        let opened = json!({"type": "email.opened"});
+        let (_, body) = json(
+            &app,
+            json_request(
+                with_key("POST", &format!("/api/v1/messages/{id}/events"), &key),
+                opened,
+            ),
+        )
+        .await;
+        assert_eq!(body["queued"], 0, "the webhook does not take opens");
+        assert!(body["note"].is_string());
+        let wrong = json!({"type": "domain.created"});
+        let (status, _) = json(
+            &app,
+            json_request(
+                with_key("POST", &format!("/api/v1/messages/{id}/events"), &key),
+                wrong,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (_, log) = json(
+            &app,
+            empty(with_key(
+                "GET",
+                &format!("/api/v1/deliveries?message={id}"),
+                &key,
+            )),
+        )
+        .await;
+        let deliveries = log["deliveries"].as_array().unwrap();
+        assert_eq!(deliveries.len(), 2);
+        assert_eq!(
+            deliveries[0]["payload"]["data"]["click"]["link"],
+            "https://x.test/go"
+        );
+
+        // Another inbox's key sees none of it.
+        let starter = store.keys(Some(DEFAULT_INBOX)).unwrap()[0]
+            .key
+            .clone()
+            .unwrap();
+        let (_, other) = json(&app, empty(with_key("GET", "/api/v1/deliveries", &starter))).await;
+        assert!(other["deliveries"].as_array().unwrap().is_empty());
+        let delivery = deliveries[0]["id"].as_str().unwrap();
+        let (status, replayed) = json(
+            &app,
+            empty(with_key(
+                "POST",
+                &format!("/api/v1/deliveries/{delivery}/replay"),
+                &key,
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replayed}");
+        assert_eq!(replayed["status"], "pending");
+
+        let patch = json!({"enabled": false});
+        let (status, hook) = json(
+            &app,
+            json_request(
+                with_key("PATCH", &format!("/api/v1/webhooks/{hook_id}"), TOKEN),
+                patch,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(hook["enabled"], false);
+        let (status, _, _) = send(
+            &app,
+            empty(with_key(
+                "DELETE",
+                &format!("/api/v1/webhooks/{hook_id}"),
+                TOKEN,
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _, _) = send(
+            &app,
+            empty(with_key(
+                "GET",
+                &format!("/api/v1/webhooks/{hook_id}"),
+                TOKEN,
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn messages_are_reached_by_either_id() {
+        let (app, store) = app(None, true);
+        let id = seed(&app, "/api/v1/messages", None).await;
+        let email_id = store.summary(id).unwrap().unwrap().email_id;
+        for path in [
+            format!("/api/v1/messages/{id}/links"),
+            format!("/api/v1/messages/{email_id}/links"),
+        ] {
+            let (status, _) = json(&app, empty(request("GET", &path))).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+        }
+        let (status, _) = json(&app, empty(request("GET", "/api/v1/messages/em_nope"))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

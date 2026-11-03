@@ -485,6 +485,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<'_, S> {
             envelope_from: self.mail_from.take().filter(|f| !f.is_empty()),
             envelope_to: std::mem::take(&mut self.recipients),
             source: Source::Smtp,
+            tags: Default::default(),
         };
         let store = self.context.store.clone();
         match tokio::task::spawn_blocking(move || store.insert(incoming)).await {

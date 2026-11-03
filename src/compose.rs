@@ -139,6 +139,10 @@ pub struct SendRequest {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub attachments: Vec<AttachmentInput>,
+    /// Tags carried into the message's webhook events: `[{"name", "value"}]`
+    /// or an object.
+    #[serde(default)]
+    pub tags: serde_json::Value,
 }
 
 fn builder_list(addresses: &[Address]) -> BuilderAddress<'_> {
@@ -162,6 +166,7 @@ impl SendRequest {
         if to.is_empty() && cc.is_empty() && bcc.is_empty() {
             bail!("at least one recipient is required in `to`, `cc` or `bcc`");
         }
+        let tags = crate::store::tags_from_json(&self.tags).map_err(anyhow::Error::msg)?;
 
         let mut builder = MessageBuilder::new().from(BuilderAddress::new_address(
             from.name.as_deref(),
@@ -257,6 +262,7 @@ impl SendRequest {
                 .map(|a| a.address)
                 .collect(),
             source: Source::Api,
+            tags,
         })
     }
 }

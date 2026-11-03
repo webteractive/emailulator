@@ -113,8 +113,10 @@ curl -X POST http://127.0.0.1:8025/api/v1/messages \
        "subject": "Your order shipped", "text": "Plain body", "html": "<p>Rich body</p>"}'
 ```
 
-Also accepted: `cc`, `bcc`, `reply_to`, `headers`, and `attachments`
-(`[{"filename", "content": "<base64>", "content_type"?}]`). Any other content
+Also accepted: `cc`, `bcc`, `reply_to`, `headers`, `attachments`
+(`[{"filename", "content": "<base64>", "content_type"?}]`), and `tags`
+(`[{"name", "value"}]` or an object), which the message's
+[webhook](#webhooks) events carry. Any other content
 type is taken as a raw RFC 5322 message, with `?from=` and `?to=` for the
 envelope.
 
@@ -130,14 +132,21 @@ admin token, or anyone on a local server without one).
 | `PATCH`, `DELETE /api/v1/messages` | Mark read, or delete, everything the filters select |
 | `GET /api/v1/messages/{id}` | Headers, bodies, attachment list |
 | `PATCH`, `DELETE /api/v1/messages/{id}` | `{"read", "starred"}`, or delete |
-| `GET /api/v1/messages/{id}/raw` · `/html` · `/links` · `/check` | The `.eml`, the sandboxed HTML, its links, the client check |
+| `GET /api/v1/messages/{id}/raw` · `/html` · `/links` · `/check` | The `.eml`, the sandboxed HTML, its links, the client and deliverability check |
 | `GET /api/v1/messages/{id}/attachments/{index}` | One attachment |
+| `POST /api/v1/messages/{id}/events` | Send its inbox's webhooks an event: `{"type", "link"?}` |
 | `GET /api/v1/inboxes` | Inboxes with counts |
 | `POST`, `PATCH`, `DELETE /api/v1/inboxes[/{id}]` | *Admin.* Manage inboxes |
 | `GET`, `POST /api/v1/inboxes/{id}/keys` | *Admin.* List keys, or create one |
 | `POST …/keys/{key_id}/regenerate`, `DELETE …/keys/{key_id}` | *Admin.* Replace or revoke a key |
+| `GET`, `POST /api/v1/webhooks` | *Admin.* List webhooks, or add one: `{"inbox"?, "endpoint", "events"?, "verify_tls"?}` |
+| `GET`, `PATCH`, `DELETE /api/v1/webhooks/{id}` | *Admin.* One webhook; `PATCH` takes `endpoint`, `events`, `enabled`, `verify_tls` |
+| `GET /api/v1/deliveries` | The webhook delivery log, newest first; filters `inbox`, `webhook`, `message`, `limit` |
+| `POST /api/v1/deliveries/{id}/replay` | Send a delivery again |
 | `GET /api/v1/events` | Server-sent events as mail arrives and changes |
 | `GET /api/v1/info` · `GET /healthz` | Server details · `ok` |
+
+`{id}` is a message's number or its `em_…` email ID.
 
 Filters: `inbox` (admin), `to`, `q`, `unread`, `starred`, `before`, `after`,
 `since`, `limit`. An unknown filter is an error, so a typo cannot widen a bulk
@@ -158,9 +167,9 @@ Or over stdio, straight from the store on this machine:
 
 Tools: `list_messages`, `get_message`, `wait_for_message`, `get_links`,
 `check_message`, `get_attachment`, `get_raw_message`, `list_inboxes`,
-`mark_message`, `send_message`, `delete_messages`. `wait_for_message` is for
-tests: trigger a sign-up, then wait for the mail by recipient and get its body
-and links in one call.
+`mark_message`, `send_message`, `delete_messages`, `simulate_event`,
+`list_webhook_deliveries`. `wait_for_message` is for tests: trigger a sign-up,
+then wait for the mail by recipient and get its body and links in one call.
 
 ## Client check
 
@@ -182,6 +191,79 @@ look at. It also flags HTML past Gmail's 102 KB clipping point, a missing
 plain-text part, images without alt text, and attachments Gmail or Outlook
 refuse. Outlook conditional comments are not checked.
 
+### Deliverability
+
+Above the clients, the same tab (and the `deliverability` field of the check)
+says what the message itself shows of how receivers will treat it, worst first:
+
+- **DKIM**: each signature's tags, and whether its body hash still matches the
+  body, for the first five signatures. The signature proper needs the key from
+  DNS, which the receiver looks up and this does not.
+- **DMARC alignment**: whether a signature, or else the envelope sender, is for
+  the From address's domain.
+- **One-click unsubscribe**: `List-Unsubscribe` with an `https:` address,
+  `List-Unsubscribe-Post`, and both under the DKIM signature, as Gmail and Yahoo
+  require of bulk mail.
+- **Headers** spam filters score when missing or odd: From, Date, Message-ID,
+  Subject.
+- **Links**: to this machine or network (a wrong `APP_URL`), to bare IP
+  addresses, through shorteners, or whose text names another site.
+- **Image-only HTML**.
+
+For a spam score as well, point it at a SpamAssassin `spamd`:
+
+```sh
+emailulator run --spamassassin 127.0.0.1:783
+```
+
+The score and the rules that matched then appear with the findings. Messages
+over 500 KB are not scored, as `spamc` would not score them either. What
+SpamAssassin's network tests find depends on how that `spamd` is set up.
+
+## Webhooks
+
+An inbox can post events about its mail to your application, so the handler
+that would hear of deliveries and bounces from an email provider can be tested
+locally. As mail arrives, each of the inbox's webhooks gets `email.sent` then
+`email.delivered`. Mail to a test address has the outcome it names instead,
+with or without a `+label`:
+
+| Recipient | Events |
+| --- | --- |
+| `bounced@emailulator.test` | `email.sent`, `email.bounced` |
+| `suppressed@emailulator.test` | `email.suppressed` |
+| `complained@emailulator.test` | `email.sent`, `email.delivered`, `email.complained` |
+
+Any other event (`email.opened`, `email.clicked`, `email.failed`,
+`email.delivery_delayed`, `email.scheduled` and the rest) is sent on demand
+from a message's Webhooks tab, `POST /api/v1/messages/{id}/events`, or the
+`simulate_event` MCP tool.
+
+```sh
+emailulator webhook add billing-app http://localhost:8000/webhooks/email
+emailulator webhook list
+emailulator webhook show <id>        # its secret and latest deliveries
+emailulator webhook disable <id>     # enable, remove
+```
+
+Each event is a JSON body of `{"type", "created_at", "data"}`, where `data`
+has the message's `email_id` (`em_…`), `from`, `to`, `subject`, `message_id`
+and `tags`, and a `bounce`, `click`, `failed` or `suppressed` block for those
+events. It is signed as [Standard Webhooks](https://www.standardwebhooks.com)
+describes: `webhook-id`, `webhook-timestamp` and `webhook-signature` headers,
+an HMAC-SHA256 with the webhook's `whsec_…` secret, so any Standard Webhooks
+library verifies it.
+
+Anything but a 2xx answer is tried again after 5 seconds, 5 minutes,
+30 minutes, 2, 5, 10 and 10 hours, then marked failed. The delivery log, in
+the web UI and at `GET /api/v1/deliveries`, keeps each answer, and a delivery
+can be replayed. An `https` endpoint is checked against the system's trusted
+certificates; add the webhook with `--insecure`, or tick *Accept any TLS certificate* in
+the web UI, for a self-signed one. A server with an admin token, or one
+reachable from other machines, posts only to public addresses unless started
+with `--allow-private-webhooks`. A webhook holds at most 1,000 deliveries
+waiting to be sent; beyond that the oldest are marked failed.
+
 ## Desktop app
 
 `emailulator app` opens the web UI in a window of its own on macOS, running the
@@ -193,8 +275,9 @@ it does not connect to a remote server.
 
 `emailulator service install` runs `emailulator run` as a LaunchAgent: it starts
 at login, starts again whenever it stops, and needs nothing left open.
-`self-update --restart` brings it back on the new binary. Options for `run` go
-after `--`:
+`self-update --restart` brings it back on the new binary. Installing again
+replaces the agent, and if the new one cannot start, the old one is started
+again. Options for `run` go after `--`:
 
 ```sh
 emailulator service install -- --max-messages 5000
@@ -277,6 +360,8 @@ On/off variables take `1`/`0`, `true`/`false`, `yes`/`no` or `on`/`off`.
 | `EMAILULATOR_MAX_MESSAGES` | `1000` | Oldest dropped beyond this, across all inboxes; `0` keeps all |
 | `EMAILULATOR_MAX_STORAGE` | `1GB` | Oldest dropped beyond this; `0` for no cap |
 | `EMAILULATOR_NO_UI` | off | API and MCP only |
+| `EMAILULATOR_SPAMASSASSIN` | none | SpamAssassin's `spamd` as `host[:port]`, for a spam score in the check |
+| `EMAILULATOR_ALLOW_PRIVATE_WEBHOOKS` | off | Post webhooks to this machine and private networks from a server with a token or an exposed listener |
 
 Pass secrets through the environment or a `_FILE`, not a flag: arguments are
 visible to every user in the process list.
@@ -308,6 +393,11 @@ whoever sends it. The design assumes both.
   client.
 - **It never relays**, and size, recipients, connections, message count and
   storage are all capped.
+- **Webhooks stay off the local network** unless the server is yours alone:
+  with an admin token or an exposed HTTP listener, endpoints on this machine,
+  private or link-local addresses are refused, and the address checked is the
+  one connected to. A loopback server with no token, or
+  `--allow-private-webhooks`, allows them. Only the admin adds webhooks.
 
 The database is created `0600` in a `0700` directory, unencrypted.
 

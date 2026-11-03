@@ -32,6 +32,7 @@ pub struct Options {
     pub smtp_addr: Option<SocketAddr>,
     pub http_addr: Option<SocketAddr>,
     pub data_dir: Option<PathBuf>,
+    pub spamassassin: Option<String>,
 }
 
 /// Ports to fall back to, in order, when the usual pair is taken: by another
@@ -53,6 +54,7 @@ fn candidates(options: Options) -> Vec<Config> {
     let defaults = Config::default();
     let base = Config {
         data_dir: Some(options.data_dir.unwrap_or_else(default_data_dir)),
+        spamassassin: options.spamassassin,
         ..defaults.clone()
     };
     let chosen = options.smtp_addr.is_some() || options.http_addr.is_some();

@@ -291,7 +291,7 @@ fn dataset() -> &'static Dataset {
 // The report
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Report {
     /// The date of the compatibility data this was checked against.
     pub data_updated: String,
@@ -303,6 +303,11 @@ pub struct Report {
     pub issues: Vec<Issue>,
     /// Things worth knowing that are not about one feature.
     pub notices: Vec<Notice>,
+    /// How receivers are likely to treat the message, worst first: filled in
+    /// by the caller from `deliverability::check`, which needs the raw bytes.
+    pub deliverability: Vec<crate::deliverability::Finding>,
+    /// SpamAssassin's score, when the server is configured with one.
+    pub spam: Option<crate::deliverability::Spam>,
 }
 
 /// How much of what a message uses one client supports. Each feature found is
@@ -502,6 +507,8 @@ pub fn check(detail: &MessageDetail, only: Option<&[String]>) -> Report {
         clients,
         issues,
         notices: notices(detail, &found),
+        deliverability: Vec::new(),
+        spam: None,
     }
 }
 
@@ -1303,6 +1310,7 @@ mod tests {
         MessageDetail {
             summary: MessageSummary {
                 id: 1,
+                email_id: "em_test".into(),
                 received_at: 0,
                 from: None,
                 to: Vec::new(),
@@ -1327,6 +1335,7 @@ mod tests {
             html: html.map(str::to_string),
             headers: Vec::new(),
             attachments: Vec::new(),
+            tags: Default::default(),
         }
     }
 

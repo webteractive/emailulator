@@ -17,7 +17,18 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 
 /// The agent's launchd label, the identifier the release is signed with.
-pub const LABEL: &str = "com.webteractive.emailulator";
+pub const LABEL: &str = "co.webteractive.emailulator";
+
+/// Labels earlier releases installed the agent under: 0.1.3 used `com.`.
+/// Such an agent is still found, so that `status`, `run` and the app see it,
+/// and after a self-update it still knows it is the agent rather than
+/// refusing to start beside itself. `install` and `uninstall` take it down.
+const LEGACY_LABELS: &[&str] = &["com.webteractive.emailulator"];
+
+/// Every label an agent may be installed under, the current one first.
+fn labels() -> impl Iterator<Item = &'static str> {
+    std::iter::once(LABEL).chain(LEGACY_LABELS.iter().copied())
+}
 
 /// Set in the agent's environment, so that the `run` it starts knows it is
 /// the agent and does not refuse to start because the agent is running.
@@ -58,12 +69,16 @@ pub fn reachable(addr: SocketAddr) -> SocketAddr {
 
 /// Whether this process was started by the agent.
 pub fn is_the_agent() -> bool {
-    std::env::var(MARKER).is_ok_and(|label| label == LABEL)
+    std::env::var(MARKER).is_ok_and(|marker| labels().any(|label| label == marker))
 }
 
 /// The installed agent, as launchd reports it and as its plist starts it.
 #[derive(Debug, Clone, Serialize)]
 pub struct Agent {
+    /// The label it is installed under, `LABEL` unless an earlier release
+    /// installed it. Reported by `status` itself.
+    #[serde(skip)]
+    pub label: &'static str,
     pub plist: PathBuf,
     pub log: PathBuf,
     /// What launchd runs: this binary, `run` and its options.
@@ -86,6 +101,15 @@ impl Agent {
         format!("{scheme}://{}/", reachable(self.http_addr))
     }
 
+    /// Whether it is running and listens on `addr`'s port, which it frees
+    /// when taken down.
+    fn holds(&self, addr: SocketAddr) -> bool {
+        self.running
+            && [self.smtp_addr, self.http_addr]
+                .iter()
+                .any(|own| own.port() == addr.port())
+    }
+
     /// Whether both of its servers answer, within `wait`.
     pub fn answers(&self, wait: Duration) -> bool {
         answering(self.smtp_addr, self.http_addr, wait)
@@ -98,15 +122,19 @@ pub fn installed() -> Result<Option<Agent>> {
         return Ok(None);
     }
     let paths = paths()?;
-    if !paths.plist.exists() {
+    let Some((label, plist)) = labels()
+        .map(|label| (label, paths.plist(label)))
+        .find(|(_, plist)| plist.exists())
+    else {
         return Ok(None);
-    }
-    let program = read_program(&paths.plist)?;
+    };
+    let program = read_program(&plist)?;
     let args = program.get(2..).unwrap_or_default();
     let (smtp_addr, http_addr) = addresses(args)?;
-    let launchd = launchctl_print()?;
+    let launchd = launchctl_print(label)?;
     Ok(Some(Agent {
-        plist: paths.plist,
+        label,
+        plist,
         log: paths.log,
         tls: flag_value(args, "--tls-cert").is_some(),
         program,
@@ -164,38 +192,66 @@ pub fn install(run: &[String]) -> Result<()> {
         .context("finding this program for the agent to run")?;
     let paths = paths()?;
 
-    // A reinstall replaces the agent, so take the old one down first, and
-    // wait for its ports to be free before checking whether anything else
-    // holds them.
-    if launchctl_print()?.is_some() {
-        bootout()?;
+    // Something else on the new ports stops the install before the agent it
+    // replaces is touched. The ports that agent holds are about to be freed.
+    // One whose plist cannot be read does not stop the install that fixes it.
+    let previous = running();
+    let busy = [smtp_addr, http_addr]
+        .into_iter()
+        .filter(|&addr| !previous.as_ref().is_some_and(|agent| agent.holds(addr)))
+        .find_map(listening);
+    if let Some(addr) = busy {
+        return Err(ports_taken(addr));
+    }
+
+    // A reinstall replaces the agent, so take the old one down, under
+    // whichever label it has, and wait for its ports to be free. Its plist
+    // stays until the new agent is in, so a failure can put it back.
+    let domain = domain()?;
+    let mut replaced = Vec::new();
+    for label in labels() {
+        if launchctl_print(label)?.is_some() {
+            if let Err(error) = bootout(label) {
+                restore(&domain, &replaced);
+                return Err(error);
+            }
+            replaced.push(paths.plist(label));
+        }
+    }
+    if !replaced.is_empty() {
         let deadline = Instant::now() + Duration::from_secs(5);
         while listening(smtp_addr).or(listening(http_addr)).is_some() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
     if let Some(addr) = listening(smtp_addr).or(listening(http_addr)) {
-        bail!(
-            "something is already listening on {addr}: the desktop app, an `emailulator run` or \
-             another mail catcher. Quit it and install again, or give the agent other ports: \
-             emailulator service install -- --smtp-addr 127.0.0.1:2525 --http-addr 127.0.0.1:8525"
-        );
+        restore(&domain, &replaced);
+        return Err(ports_taken(addr));
     }
 
     let program = program_arguments(&exe, run);
-    let plist = render_plist(&program, &paths.log);
-    for dir in [paths.plist.parent(), paths.log.parent()]
-        .into_iter()
-        .flatten()
-    {
+    let plist = paths.plist(LABEL);
+    for dir in [plist.parent(), paths.log.parent()].into_iter().flatten() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    write_private(&paths.plist, &plist)?;
-    launchctl(&["bootstrap", &domain()?, &paths.plist.display().to_string()])?;
+    let before = std::fs::read_to_string(&plist).ok();
+    let started = write_private(&plist, &render_plist(&program, &paths.log))
+        .and_then(|()| launchctl(&["bootstrap", &domain, &plist.display().to_string()]));
+    if let Err(error) = started {
+        let _ = match &before {
+            Some(before) => write_private(&plist, before),
+            None => remove_plist(&plist),
+        };
+        restore(&domain, &replaced);
+        return Err(error);
+    }
+    for label in LEGACY_LABELS {
+        remove_plist(&paths.plist(label))?;
+    }
 
     println!("Installed the LaunchAgent {LABEL}.");
     println!("  Runs     {}", program.join(" "));
-    println!("  Plist    {}", paths.plist.display());
+    println!("  Plist    {}", plist.display());
     println!("  Log      {}", paths.log.display());
     if exe.components().any(|part| part.as_os_str() == "target") {
         println!(
@@ -216,7 +272,8 @@ pub fn install(run: &[String]) -> Result<()> {
     }
 
     let agent = Agent {
-        plist: paths.plist,
+        label: LABEL,
+        plist,
         log: paths.log.clone(),
         tls: flag_value(run, "--tls-cert").is_some(),
         program,
@@ -249,23 +306,47 @@ pub fn install(run: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn ports_taken(addr: SocketAddr) -> anyhow::Error {
+    anyhow!(
+        "something is already listening on {addr}: the desktop app, an `emailulator run` or \
+         another mail catcher. Quit it and install again, or give the agent other ports: \
+         emailulator service install -- --smtp-addr 127.0.0.1:2525 --http-addr 127.0.0.1:8525"
+    )
+}
+
+/// Start again the agents `install` took down, when it could not replace
+/// them, so a failed install leaves the one that was running.
+fn restore(domain: &str, plists: &[PathBuf]) {
+    for plist in plists.iter().filter(|plist| plist.exists()) {
+        let _ = launchctl(&["bootstrap", domain, &plist.display().to_string()]);
+    }
+}
+
 /// Stop the agent and remove it. Messages and logs stay.
 pub fn uninstall() -> Result<()> {
     macos_only()?;
     let paths = paths()?;
-    let loaded = launchctl_print()?.is_some();
-    if !loaded && !paths.plist.exists() {
+    let mut removed = Vec::new();
+    for label in labels() {
+        let plist = paths.plist(label);
+        let loaded = launchctl_print(label)?.is_some();
+        if !loaded && !plist.exists() {
+            continue;
+        }
+        if loaded {
+            bootout(label)?;
+        }
+        remove_plist(&plist)?;
+        removed.push(label);
+    }
+    if removed.is_empty() {
         println!("The LaunchAgent {LABEL} is not installed.");
         return Ok(());
     }
-    if loaded {
-        bootout()?;
-    }
-    if paths.plist.exists() {
-        std::fs::remove_file(&paths.plist)
-            .with_context(|| format!("removing {}", paths.plist.display()))?;
-    }
-    println!("Stopped and removed the LaunchAgent {LABEL}.");
+    println!(
+        "Stopped and removed the LaunchAgent {}.",
+        removed.join(", ")
+    );
     println!(
         "Messages stay in the message store, and the log in {}.",
         paths.log.display()
@@ -297,7 +378,7 @@ pub fn status(json: bool) -> Result<ExitCode> {
     };
     if json {
         let status = Status {
-            label: LABEL,
+            label: agent.as_ref().map_or(LABEL, |agent| agent.label),
             installed: agent.is_some(),
             answering,
             agent,
@@ -325,7 +406,7 @@ pub fn status(json: bool) -> Result<ExitCode> {
     } else {
         "not answering"
     };
-    println!("LaunchAgent  {LABEL}");
+    println!("LaunchAgent  {}", agent.label);
     println!("  State      {state}");
     println!("  SMTP       {}  ({answer})", agent.smtp_addr);
     println!("  Web UI     {}", agent.origin());
@@ -334,6 +415,12 @@ pub fn status(json: bool) -> Result<ExitCode> {
     println!("  Log        {}", agent.log.display());
     if !answering {
         println!("\nThe end of its log:\n\n{}", log_tail(&agent.log, 10));
+    }
+    if agent.label != LABEL {
+        println!(
+            "\nAn earlier release installed it under this label. `emailulator service install` \
+             replaces it with {LABEL}, keeping the mail; pass the options it runs with after `--`."
+        );
     }
     println!("\nFor scripts: emailulator service status --json");
     Ok(ExitCode::from(code))
@@ -344,18 +431,30 @@ pub fn status(json: bool) -> Result<ExitCode> {
 // ---------------------------------------------------------------------------
 
 struct Paths {
-    plist: PathBuf,
+    agents: PathBuf,
     log: PathBuf,
+}
+
+impl Paths {
+    /// Where the agent's plist is under `label`.
+    fn plist(&self, label: &str) -> PathBuf {
+        self.agents.join(format!("{label}.plist"))
+    }
 }
 
 fn paths() -> Result<Paths> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("finding your home directory"))?;
     Ok(Paths {
-        plist: home
-            .join("Library/LaunchAgents")
-            .join(format!("{LABEL}.plist")),
+        agents: home.join("Library/LaunchAgents"),
         log: home.join("Library/Logs/emailulator/server.log"),
     })
+}
+
+fn remove_plist(plist: &Path) -> Result<()> {
+    if plist.exists() {
+        std::fs::remove_file(plist).with_context(|| format!("removing {}", plist.display()))?;
+    }
+    Ok(())
 }
 
 fn macos_only() -> Result<()> {
@@ -553,8 +652,8 @@ fn launchctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn bootout() -> Result<()> {
-    launchctl(&["bootout", &format!("{}/{LABEL}", domain()?)])
+fn bootout(label: &str) -> Result<()> {
+    launchctl(&["bootout", &format!("{}/{label}", domain()?)])
 }
 
 /// What `launchctl print` says of the agent.
@@ -565,10 +664,11 @@ struct Launchd {
     last_exit_code: Option<String>,
 }
 
-/// The agent as launchd has it, or `None` when it is not loaded.
-fn launchctl_print() -> Result<Option<Launchd>> {
+/// The agent under `label` as launchd has it, or `None` when it is not
+/// loaded.
+fn launchctl_print(label: &str) -> Result<Option<Launchd>> {
     let output = Command::new("/bin/launchctl")
-        .args(["print", &format!("{}/{LABEL}", domain()?)])
+        .args(["print", &format!("{}/{label}", domain()?)])
         .output()
         .context("running launchctl")?;
     if !output.status.success() {
@@ -728,6 +828,22 @@ mod tests {
         assert!(!plist.contains("A&B"));
         assert!(plist.contains(&format!("<key>{MARKER}</key>")));
         assert!(plist.contains("<key>KeepAlive</key>\n\t<true/>"));
+        assert!(plist.contains("<key>Label</key>\n\t<string>co.webteractive.emailulator</string>"));
+    }
+
+    #[test]
+    fn an_agent_from_an_earlier_release_is_still_found() {
+        let labels: Vec<_> = labels().collect();
+        assert_eq!(labels[0], LABEL, "the current label is looked for first");
+        assert!(labels.contains(&"com.webteractive.emailulator"), "0.1.3's");
+        let paths = Paths {
+            agents: PathBuf::from("/Users/me/Library/LaunchAgents"),
+            log: PathBuf::new(),
+        };
+        assert_eq!(
+            paths.plist("com.webteractive.emailulator"),
+            Path::new("/Users/me/Library/LaunchAgents/com.webteractive.emailulator.plist")
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -762,7 +878,7 @@ mod tests {
 
     #[test]
     fn launchctl_print_is_read_at_the_service_level() {
-        let output = "gui/502/com.webteractive.emailulator = {\n\
+        let output = "gui/502/co.webteractive.emailulator = {\n\
             \tactive count = 1\n\
             \tstate = running\n\
             \n\
@@ -789,6 +905,7 @@ mod tests {
     #[test]
     fn the_origin_reaches_a_wildcard_address() {
         let agent = Agent {
+            label: LABEL,
             plist: PathBuf::new(),
             log: PathBuf::new(),
             program: Vec::new(),
@@ -801,6 +918,13 @@ mod tests {
             last_exit_code: None,
         };
         assert_eq!(agent.origin(), "http://127.0.0.1:8025/");
+        assert!(agent.holds("127.0.0.1:1025".parse().unwrap()));
+        assert!(!agent.holds("127.0.0.1:2525".parse().unwrap()));
+        let stopped = Agent {
+            running: false,
+            ..agent.clone()
+        };
+        assert!(!stopped.holds("127.0.0.1:1025".parse().unwrap()));
         assert_eq!(
             Agent { tls: true, ..agent }.origin(),
             "https://127.0.0.1:8025/"

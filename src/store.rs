@@ -14,6 +14,9 @@
 //! `from:`, `to:`, `subject:`, `is:unread`, `is:read`, `is:starred` and
 //! `has:attachment`. Double quotes keep a phrase together: `subject:"reset link"`.
 
+mod webhooks;
+
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,17 +24,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 
 use crate::model::{
     Address, ApiKey, AttachmentMeta, Event, Inbox, Link, ListFilter, MessageDetail, MessageSummary,
     Page, Source, Stats,
 };
 use crate::parse;
-use crate::security::{API_KEY_PREFIX, generate_api_key, generate_inbox_id, hash_api_key};
+use crate::security::{
+    API_KEY_PREFIX, generate_api_key, generate_inbox_id, generate_public_id, hash_api_key,
+};
+
+pub use webhooks::{
+    Attempt, DeliveryFilter, DueDelivery, NewWebhook, WebhookChanges, WebhookError, tags_from_json,
+};
 
 const DEFAULT_PAGE: usize = 50;
 const MAX_PAGE: usize = 500;
+
+/// What a message's public id starts with.
+pub const EMAIL_ID_PREFIX: &str = "em_";
 
 /// The inbox that always exists. Mail that arrives without an API key lands
 /// here, which is what keeps a local setup working with no configuration.
@@ -78,7 +90,11 @@ CREATE TABLE IF NOT EXISTS messages (
     attachment_count INTEGER NOT NULL,
     read             INTEGER NOT NULL DEFAULT 0,
     starred          INTEGER NOT NULL DEFAULT 0,
-    raw              BLOB    NOT NULL
+    raw              BLOB    NOT NULL,
+    -- The public id, `em_` and 24 letters and digits.
+    public_id        TEXT,
+    -- Tags the sender attached, as a JSON object.
+    tags_json        TEXT    NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS recipients (
     message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -86,12 +102,45 @@ CREATE TABLE IF NOT EXISTS recipients (
     PRIMARY KEY (message_id, address)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS recipients_by_address ON recipients(address, message_id);
+-- Where an inbox's events are posted, signed as Standard Webhooks describes.
+CREATE TABLE IF NOT EXISTS webhooks (
+    id          TEXT    PRIMARY KEY,
+    inbox       TEXT    NOT NULL REFERENCES inboxes(id) ON DELETE CASCADE,
+    endpoint    TEXT    NOT NULL,
+    events_json TEXT    NOT NULL DEFAULT '[]',
+    secret      TEXT    NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    verify_tls  INTEGER NOT NULL DEFAULT 1,
+    created_at  INTEGER NOT NULL
+) WITHOUT ROWID;
+-- Events waiting to be posted, or posted: the queue and its log in one.
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+    id              TEXT    NOT NULL UNIQUE,
+    webhook         TEXT    NOT NULL REFERENCES webhooks(id) ON DELETE CASCADE,
+    inbox           TEXT    NOT NULL,
+    email_id        TEXT,
+    type            TEXT    NOT NULL,
+    payload         TEXT    NOT NULL,
+    status          TEXT    NOT NULL DEFAULT 'pending',
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    -- Unix milliseconds; null once it has succeeded or been given up.
+    next_attempt_at INTEGER,
+    last_attempt_at INTEGER,
+    last_status     INTEGER,
+    last_error      TEXT,
+    last_response   TEXT,
+    created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS deliveries_due ON webhook_deliveries(next_attempt_at)
+    WHERE next_attempt_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS deliveries_by_email ON webhook_deliveries(email_id);
 ";
 
 const SUMMARY_COLUMNS: &str = "m.id, m.received_at, m.source, m.from_name, m.from_address, \
     m.to_json, m.cc_json, m.subject, m.snippet, m.size, m.attachment_count, m.read, m.starred, \
     (SELECT group_concat(address, char(10)) FROM recipients WHERE message_id = m.id), m.inbox, \
-    (SELECT name FROM inboxes WHERE id = m.inbox)";
+    (SELECT name FROM inboxes WHERE id = m.inbox), m.public_id";
 
 /// Retention bounds. Zero disables a bound.
 #[derive(Debug, Clone, Copy)]
@@ -196,12 +245,16 @@ pub struct Incoming {
     /// headers instead.
     pub envelope_to: Vec<String>,
     pub source: Source,
+    /// Tags the sender attached, carried into the message's webhook events.
+    pub tags: BTreeMap<String, String>,
 }
 
 pub struct Store {
     conn: Mutex<Connection>,
     events: broadcast::Sender<Event>,
     limits: Limits,
+    /// Woken when webhook deliveries are queued, for the worker that sends them.
+    deliveries_queued: Notify,
 }
 
 pub fn now_ms() -> i64 {
@@ -386,10 +439,31 @@ fn summary_from_row(row: &Row<'_>) -> rusqlite::Result<MessageSummary> {
         starred: row.get(12)?,
         inbox: row.get(14)?,
         inbox_name: row.get::<_, Option<String>>(15)?.unwrap_or_default(),
+        email_id: row.get::<_, Option<String>>(16)?.unwrap_or_default(),
         recipients: recipients
             .map(|m| m.lines().map(str::to_string).collect())
             .unwrap_or_default(),
     })
+}
+
+/// Give every message that has none a public id.
+fn backfill_public_ids(conn: &Connection) -> Result<()> {
+    let ids = conn
+        .prepare("SELECT id FROM messages WHERE public_id IS NULL")?
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN")?;
+    for id in ids {
+        conn.execute(
+            "UPDATE messages SET public_id = ? WHERE id = ?",
+            params![generate_public_id(EMAIL_ID_PREFIX), id],
+        )?;
+    }
+    conn.execute_batch("COMMIT")?;
+    Ok(())
 }
 
 fn key_from_row(row: &Row<'_>) -> rusqlite::Result<ApiKey> {
@@ -536,11 +610,33 @@ impl Store {
         }
         create_starter_key(&conn)?;
 
+        // Messages were once known by their row id alone.
+        for (column, definition) in [
+            ("public_id", "TEXT"),
+            ("tags_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ] {
+            let present: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = ?",
+                [column],
+                |row| row.get(0),
+            )?;
+            if present == 0 {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE messages ADD COLUMN {column} {definition}"
+                ))?;
+            }
+        }
+        backfill_public_ids(&conn)?;
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS messages_by_public_id ON messages(public_id)",
+        )?;
+
         let (events, _) = broadcast::channel(256);
         Ok(Self {
             conn: Mutex::new(conn),
             events,
             limits,
+            deliveries_queued: Notify::new(),
         })
     }
 
@@ -970,14 +1066,30 @@ impl Store {
 
         let received_at = now_ms();
         let size = incoming.raw.len();
+        let email_id = generate_public_id(EMAIL_ID_PREFIX);
+        let email = crate::webhook::Email {
+            email_id: email_id.clone(),
+            created_at: received_at,
+            message_id: parsed.message_id.clone(),
+            from: parsed.from.as_ref().map(Address::display),
+            to: if parsed.to.is_empty() {
+                recipients.clone()
+            } else {
+                parsed.to.iter().map(|a| a.address.clone()).collect()
+            },
+            subject: parsed.subject.clone(),
+            tags: incoming.tags.clone(),
+            first_link: parse::links(&parsed).into_iter().next().map(|l| l.url),
+        };
         let mut pruned: Vec<(i64, String)> = Vec::new();
-        let id = {
+        let (id, queued) = {
             let mut conn = self.conn();
             let tx = conn.transaction()?;
             tx.execute(
                 "INSERT INTO messages (inbox, received_at, source, envelope_from, from_name, \
                  from_address, to_json, cc_json, recipients_text, subject, snippet, search_text, \
-                 size, attachment_count, raw) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 size, attachment_count, raw, public_id, tags_json) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     incoming.inbox,
                     received_at,
@@ -994,9 +1106,14 @@ impl Store {
                     size as i64,
                     parsed.attachments.len() as i64,
                     incoming.raw,
+                    email_id,
+                    serde_json::to_string(&incoming.tags)?,
                 ],
             )?;
             let id = tx.last_insert_rowid();
+            let events = crate::webhook::arrival_events(&recipients);
+            let queued =
+                webhooks::enqueue(&tx, &incoming.inbox, &email, events, &Default::default())?;
             for address in &recipients {
                 tx.execute(
                     "INSERT OR IGNORE INTO recipients (message_id, address) VALUES (?, ?)",
@@ -1038,11 +1155,15 @@ impl Store {
                 tx.execute("DELETE FROM messages WHERE id = ?", [old])?;
             }
             tx.commit()?;
-            id
+            (id, queued)
         };
+        if queued > 0 {
+            self.deliveries_queued.notify_one();
+        }
 
         let summary = MessageSummary {
             id,
+            email_id,
             received_at,
             from: parsed.from.clone(),
             to: parsed.to.clone(),
@@ -1124,16 +1245,34 @@ impl Store {
             .optional()?)
     }
 
+    /// The row id of a message named by its row id or its public id.
+    pub fn message_ref(&self, text: &str) -> Result<Option<i64>> {
+        if let Ok(id) = text.parse::<i64>() {
+            return Ok(Some(id));
+        }
+        if !text.starts_with(EMAIL_ID_PREFIX) {
+            return Ok(None);
+        }
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id FROM messages WHERE public_id = ?",
+                [text],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn get(&self, id: i64) -> Result<Option<MessageDetail>> {
         let Some(summary) = self.summary(id)? else {
             return Ok(None);
         };
-        let (raw, envelope_from): (Vec<u8>, Option<String>) = {
+        let (raw, envelope_from, tags): (Vec<u8>, Option<String>, String) = {
             let conn = self.conn();
             conn.query_row(
-                "SELECT raw, envelope_from FROM messages WHERE id = ?",
+                "SELECT raw, envelope_from, tags_json FROM messages WHERE id = ?",
                 [id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?
         };
         let parsed = parse::parse(&raw);
@@ -1148,6 +1287,7 @@ impl Store {
             html: parsed.html,
             headers: parsed.headers,
             attachments: parsed.attachments,
+            tags: serde_json::from_str(&tags).unwrap_or_default(),
         }))
     }
 
@@ -1312,6 +1452,7 @@ mod tests {
             envelope_from: Some(from.to_string()),
             envelope_to: vec![to.to_string()],
             source: Source::Smtp,
+            tags: BTreeMap::new(),
         }
     }
 
@@ -2110,6 +2251,21 @@ mod tests {
         let page = store.list(&in_inbox(DEFAULT_INBOX)).unwrap();
         assert_eq!(page.total, 1);
         assert_eq!(page.messages[0].subject, "Old mail");
+        // It gains a public id, which stays put when the store is opened again.
+        let email_id = page.messages[0].email_id.clone();
+        assert!(email_id.starts_with(EMAIL_ID_PREFIX), "{email_id}");
+        assert!(
+            store
+                .get(page.messages[0].id)
+                .unwrap()
+                .unwrap()
+                .tags
+                .is_empty()
+        );
+        drop(store);
+        let store = Store::open(Some(&path), Limits::default()).unwrap();
+        let page = store.list(&in_inbox(DEFAULT_INBOX)).unwrap();
+        assert_eq!(page.messages[0].email_id, email_id);
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }

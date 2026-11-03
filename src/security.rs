@@ -52,6 +52,35 @@ pub fn generate_inbox_id() -> String {
     format!("ibx_{}", hex(&random_bytes::<5>()))
 }
 
+const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// A fresh public id in the style Stripe made familiar: a short prefix naming
+/// what it is, then 24 random letters and digits (about 143 bits).
+pub fn generate_public_id(prefix: &str) -> String {
+    let mut id = String::with_capacity(prefix.len() + 24);
+    id.push_str(prefix);
+    while id.len() < prefix.len() + 24 {
+        for byte in random_bytes::<32>() {
+            // 248 is the largest multiple of 62 below 256: taking only bytes
+            // under it keeps every character equally likely.
+            if byte < 248 && id.len() < prefix.len() + 24 {
+                id.push(BASE62[usize::from(byte % 62)] as char);
+            }
+        }
+    }
+    id
+}
+
+/// A fresh webhook signing secret in the Standard Webhooks form: `whsec_`
+/// and the key, 192 random bits, as base64.
+pub fn generate_webhook_secret() -> String {
+    use base64::Engine;
+    format!(
+        "whsec_{}",
+        base64::engine::general_purpose::STANDARD.encode(random_bytes::<24>())
+    )
+}
+
 /// What is stored for an API key instead of the key. The key is long and
 /// random, so a plain SHA-256 is enough: there is nothing to brute-force.
 pub fn hash_api_key(key: &str) -> String {
@@ -284,6 +313,28 @@ mod tests {
             !hash_api_key(&a).contains(&a[4..]),
             "the hash does not contain the key"
         );
+    }
+
+    #[test]
+    fn public_ids_are_a_prefix_and_24_letters_or_digits() {
+        let (a, b) = (generate_public_id("em_"), generate_public_id("em_"));
+        assert_ne!(a, b);
+        for id in [a, b] {
+            let rest = id.strip_prefix("em_").unwrap();
+            assert_eq!(rest.len(), 24, "{id}");
+            assert!(rest.bytes().all(|c| c.is_ascii_alphanumeric()), "{id}");
+        }
+    }
+
+    #[test]
+    fn webhook_secrets_decode_to_a_192_bit_key() {
+        use base64::Engine;
+        let secret = generate_webhook_secret();
+        let key = secret.strip_prefix("whsec_").unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(key)
+            .unwrap();
+        assert_eq!(bytes.len(), 24);
     }
 
     #[test]

@@ -24,7 +24,7 @@ cd "$(dirname "$0")/.."
 SIGN_IDENTITY=${EMAILULATOR_SIGN_IDENTITY:-}
 NOTARY_PROFILE=${EMAILULATOR_NOTARY_PROFILE:-notary}
 # Stable across releases, so macOS treats every version as the same program.
-IDENTIFIER=com.webteractive.emailulator
+IDENTIFIER=co.webteractive.emailulator
 
 MODE=release
 case "${1:-}" in

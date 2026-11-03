@@ -10,6 +10,19 @@ const MAX_PAGE = 500; // the API's own ceiling
 const RAW_PREVIEW_CHARS = 500_000;
 const MANY_INBOXES = 8;
 const DEFAULT_INBOX = 'default';
+// The events a webhook can be sent.
+const EVENT_TYPES = [
+  'email.sent',
+  'email.delivered',
+  'email.delivery_delayed',
+  'email.bounced',
+  'email.complained',
+  'email.opened',
+  'email.clicked',
+  'email.failed',
+  'email.suppressed',
+  'email.scheduled',
+];
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
 const ICONS = {
@@ -77,6 +90,9 @@ const state = {
   view: { kind: 'all' }, // or {kind: 'starred'} or {kind: 'inbox', id}
   panel: null, // 'connect' while an inbox's connection details are open
   keys: null, // {inbox, list} once fetched for the open panel
+  webhooks: null, // {inbox, list, deliveries} once fetched for the open panel
+  deliveries: null, // {id, list}: the open message's webhook deliveries
+  simulateType: 'email.bounced',
   query: '',
   messages: [],
   total: 0,
@@ -109,6 +125,9 @@ let leavingInbox = null;
 let listSeq = 0;
 let detailSeq = 0;
 let keysSeq = 0;
+let webhooksSeq = 0;
+let webhooksTimer = null;
+let deliveriesTimer = null;
 let events = null;
 let everConnected = false;
 let reconnectTimer = null;
@@ -189,6 +208,14 @@ function relativeTime(ms) {
     day: 'numeric',
     year: sameYear ? undefined : 'numeric',
   });
+}
+
+/** How long until a moment to come, as relativeTime says how long since. */
+function untilTime(ms) {
+  const wait = ms - Date.now();
+  if (wait < 60_000) return 'in a moment';
+  if (wait < 3_600_000) return `in ${Math.round(wait / 60_000)}m`;
+  return `in ${Math.round(wait / 3_600_000)}h`;
 }
 
 function fullTime(ms) {
@@ -401,6 +428,7 @@ async function loadKeys() {
   if (!isAdmin() || state.panel !== 'connect' || state.view.kind !== 'inbox') return;
   const inbox = state.view.id;
   if (inbox === leavingInbox) return;
+  loadWebhooks();
   const seq = ++keysSeq;
   try {
     const data = await api(`/api/v1/inboxes/${encodeURIComponent(inbox)}/keys`);
@@ -414,6 +442,41 @@ async function loadKeys() {
   }
 }
 
+async function loadWebhooks() {
+  if (!isAdmin() || state.panel !== 'connect' || state.view.kind !== 'inbox') return;
+  const inbox = state.view.id;
+  if (inbox === leavingInbox) return;
+  const seq = ++webhooksSeq;
+  const query = encodeURIComponent(inbox);
+  try {
+    const [hooks, log] = await Promise.all([
+      api(`/api/v1/webhooks?inbox=${query}`),
+      api(`/api/v1/deliveries?inbox=${query}&limit=10`),
+    ]);
+    if (seq !== webhooksSeq || state.panel !== 'connect' || state.view.id !== inbox) return;
+    state.webhooks = { inbox, list: hooks.webhooks, deliveries: log.deliveries };
+    renderWebhooks();
+  } catch (error) {
+    if (seq === webhooksSeq && error.status !== 404) report(error);
+  }
+}
+
+async function loadMessageDeliveries(id) {
+  try {
+    const data = await api(`/api/v1/deliveries?message=${encodeURIComponent(id)}&limit=50`);
+    if (state.detail?.id !== id) return;
+    state.deliveries = { id, list: data.deliveries };
+    if (effectiveTab() === 'webhooks') renderTab('webhooks');
+  } catch (error) {
+    report(error);
+  }
+}
+
+/** Whether a delivery is about to be sent, so its outcome is worth waiting for. */
+function sendingSoon(deliveries) {
+  return deliveries.some((d) => d.status === 'pending' && (d.next_attempt_at || 0) - Date.now() < 30_000);
+}
+
 async function loadDetail(id) {
   const seq = ++detailSeq;
   state.selectedId = id;
@@ -422,6 +485,7 @@ async function loadDetail(id) {
   state.raw = null;
   state.links = null;
   state.check = null;
+  state.deliveries = null;
   document.body.dataset.pane = id == null && !state.panel ? 'list' : 'reader';
   renderSelection();
   renderReader();
@@ -799,6 +863,80 @@ async function revokeKey(key) {
   }
   loadKeys();
   loadInboxes();
+}
+
+async function createWebhook(event) {
+  event.preventDefault();
+  const inbox = state.view.id;
+  const field = $('webhook-endpoint');
+  try {
+    await api('/api/v1/webhooks', {
+      method: 'POST',
+      body: { inbox, endpoint: field.value.trim(), verify_tls: !$('webhook-insecure').checked },
+    });
+    field.value = '';
+    $('webhook-insecure').checked = false;
+    loadWebhooks();
+  } catch (error) {
+    report(error);
+  }
+}
+
+async function toggleWebhook(hook) {
+  try {
+    await api(`/api/v1/webhooks/${encodeURIComponent(hook.id)}`, {
+      method: 'PATCH',
+      body: { enabled: !hook.enabled },
+    });
+  } catch (error) {
+    report(error);
+  }
+  loadWebhooks();
+}
+
+async function deleteWebhook(hook) {
+  const confirmed = await confirmAction({
+    title: 'Delete this webhook?',
+    body: `${hook.endpoint} will get no more events from this inbox, and its delivery log goes with it.`,
+    action: 'Delete webhook',
+    focusAction: false,
+  });
+  if (!confirmed) return;
+  try {
+    await api(`/api/v1/webhooks/${encodeURIComponent(hook.id)}`, { method: 'DELETE' });
+  } catch (error) {
+    if (error.status !== 404) report(error);
+  }
+  loadWebhooks();
+}
+
+async function replayDelivery(delivery) {
+  try {
+    await api(`/api/v1/deliveries/${encodeURIComponent(delivery.id)}/replay`, { method: 'POST' });
+    toast(`Sending ${delivery.type} again.`);
+  } catch (error) {
+    report(error);
+  }
+  if (state.panel === 'connect') loadWebhooks();
+  if (state.detail) setTimeout(() => loadMessageDeliveries(state.detail.id), 500);
+}
+
+async function simulateEvent(event) {
+  event.preventDefault();
+  const id = state.detail.id;
+  const type = $('simulate-type').value;
+  const link = $('simulate-link').value.trim();
+  state.simulateType = type;
+  try {
+    const answer = await api(`/api/v1/messages/${id}/events`, {
+      method: 'POST',
+      body: link ? { type, link } : { type },
+    });
+    toast(answer.queued ? `Sent ${type} to ${plural(answer.queued, 'webhook')}.` : answer.note);
+  } catch (error) {
+    report(error);
+  }
+  setTimeout(() => loadMessageDeliveries(id), 500);
 }
 
 /**
@@ -1282,6 +1420,7 @@ function renderReader() {
     ['raw', 'Raw', false],
     ['links', 'Links', false],
     ['check', 'Check', false],
+    ['webhooks', 'Webhooks', false],
   ];
   const widths = [
     ['desktop', 'Desktop', 'Full width'],
@@ -1449,6 +1588,8 @@ function renderTab(tab) {
         })
         .catch(report);
     }
+  } else if (tab === 'webhooks') {
+    renderWebhooksTab(body);
   } else if (tab === 'check') {
     const all = state.checkAll;
     if (state.check && state.check.id === detail.id && state.check.all === all) {
@@ -1466,6 +1607,70 @@ function renderTab(tab) {
         .catch(report);
     }
   }
+}
+
+function renderWebhooksTab(body) {
+  const detail = state.detail;
+  const id = detail.id;
+  const form = h(
+    'form',
+    { class: 'simulate', onsubmit: simulateEvent },
+    h('label', { for: 'simulate-type', text: 'Send event' }),
+    h(
+      'select',
+      {
+        id: 'simulate-type',
+        class: 'field',
+        onchange: (event) => {
+          state.simulateType = event.target.value;
+          $('simulate-link').hidden = event.target.value !== 'email.clicked';
+        },
+      },
+      EVENT_TYPES.map((type) => h('option', { value: type, selected: type === state.simulateType, text: type })),
+    ),
+    h('input', {
+      id: 'simulate-link',
+      class: 'field',
+      type: 'url',
+      hidden: state.simulateType !== 'email.clicked',
+      placeholder: 'Link clicked; the first in the message otherwise',
+    }),
+    h('button', { class: 'btn btn-primary', type: 'submit', text: 'Send' }),
+  );
+  const intro = h(
+    'div',
+    { class: 'webhooks-intro' },
+    h('p', null, 'Email ID ', h('code', { class: 'mono', text: detail.email_id }), ' ', copyButton(detail.email_id)),
+    h('p', {
+      class: 'hint',
+      text: 'Events about this message go to its inbox’s webhooks, as though a real provider had seen them happen.',
+    }),
+  );
+  if (!state.deliveries || state.deliveries.id !== id) {
+    fill(body, h('div', { class: 'webhooks-tab' }, intro, form, h('p', { class: 'body-note', text: 'Loading…' })));
+    loadMessageDeliveries(id);
+    return;
+  }
+  const list = state.deliveries.list;
+  fill(
+    body,
+    h(
+      'div',
+      { class: 'webhooks-tab' },
+      intro,
+      form,
+      list.length
+        ? deliveryTable(list)
+        : h('p', {
+            class: 'body-note',
+            text: isAdmin()
+              ? 'No webhook events for this message. Add a webhook in the inbox’s connection details, and mail arriving there sends email.sent and email.delivered.'
+              : 'No webhook events for this message. Webhooks are added with the admin token.',
+          }),
+    ),
+  );
+  clearTimeout(deliveriesTimer);
+  if (sendingSoon(list)) deliveriesTimer = setTimeout(() => loadMessageDeliveries(id), 1500);
 }
 
 // The clients most mail is read in; the check starts with these.
@@ -1499,6 +1704,79 @@ function noteContent(text) {
     }
   });
   return out.filter((part) => part !== '');
+}
+
+// How receivers are likely to treat the message: the server's findings, worst
+// first, and SpamAssassin's score when the server has one. Rule descriptions
+// and findings quote the message, so they go in as text.
+function renderDeliverability(data) {
+  const finding = (item) =>
+    h(
+      'li',
+      { class: `check-finding check-finding-${item.status}` },
+      h('span', { class: 'check-finding-title', text: item.title }),
+      h('span', { class: 'check-finding-message', text: item.message }),
+    );
+  const points = (n) => `${n > 0 ? '+' : ''}${n.toFixed(1)}`;
+  let spam;
+  if (!data.spam) {
+    spam = h('p', {
+      class: 'check-blurb',
+      text: 'For a spam score as well, start emailulator with --spamassassin pointing at a SpamAssassin spamd, such as 127.0.0.1:783.',
+    });
+  } else if (data.spam.error) {
+    spam = h(
+      'ul',
+      { class: 'check-findings' },
+      finding({ status: 'info', title: 'No spam score', message: data.spam.error }),
+    );
+  } else {
+    const scored = data.spam;
+    const rules = scored.rules.filter((rule) => rule.points !== 0);
+    spam = h(
+      'div',
+      { class: `check-spam check-spam-${scored.spam ? 'bad' : scored.score >= scored.required / 2 ? 'warn' : 'ok'}` },
+      h(
+        'p',
+        { class: 'check-spam-score' },
+        h('span', { class: 'check-spam-num', text: scored.score.toFixed(1) }),
+        h('span', {
+          text: ` SpamAssassin points; ${scored.required.toFixed(1)} marks it as spam. ${scored.spam ? 'This would be treated as spam.' : 'This would not.'}`,
+        }),
+      ),
+      rules.length
+        ? h(
+            'details',
+            { class: 'check-spam-rules' },
+            h('summary', { text: `${rules.length} rule${rules.length === 1 ? '' : 's'} matched` }),
+            h(
+              'ul',
+              null,
+              rules.map((rule) =>
+                h(
+                  'li',
+                  null,
+                  h('span', { class: 'check-spam-points', text: points(rule.points) }),
+                  h('span', { class: 'check-spam-rule', text: rule.name }),
+                  h('span', { class: 'check-where', text: rule.description }),
+                ),
+              ),
+            ),
+          )
+        : null,
+    );
+  }
+  return h(
+    'section',
+    { class: 'check-group check-deliverability' },
+    h('h3', { text: 'Deliverability' }),
+    h('p', {
+      class: 'check-blurb',
+      text: 'What the message itself shows of how receivers will treat it. DNS records, the sending server and its reputation are for the receiver to check.',
+    }),
+    spam,
+    h('ul', { class: 'check-findings' }, (data.deliverability || []).map(finding)),
+  );
 }
 
 // Which email clients will render the message as written. Everything shown
@@ -1577,6 +1855,8 @@ function renderCheck(data, all) {
   return h(
     'div',
     { class: 'check' },
+    renderDeliverability(data),
+    h('h3', { class: 'check-heading', text: 'Email clients' }),
     h(
       'p',
       { class: 'check-intro' },
@@ -1751,6 +2031,112 @@ function renderKeys() {
   );
 }
 
+function deliveryResult(delivery) {
+  if (delivery.last_status != null) return `HTTP ${delivery.last_status}`;
+  if (delivery.last_error) return delivery.last_error;
+  return 'waiting';
+}
+
+function deliveryTable(deliveries) {
+  return h(
+    'table',
+    { class: 'keys deliveries' },
+    h(
+      'thead',
+      null,
+      h(
+        'tr',
+        null,
+        h('th', { scope: 'col', text: 'Event' }),
+        h('th', { scope: 'col', text: 'Status' }),
+        h('th', { scope: 'col', text: 'Answer' }),
+        h('th', { scope: 'col', text: 'When' }),
+        h('th', { scope: 'col' }, h('span', { class: 'visually-hidden', text: 'Actions' })),
+      ),
+    ),
+    h(
+      'tbody',
+      null,
+      deliveries.map((delivery) => {
+        const when = delivery.last_attempt_at || delivery.created_at;
+        const retry =
+          delivery.status === 'pending' && delivery.attempts > 0 && delivery.next_attempt_at
+            ? ` · retry ${untilTime(delivery.next_attempt_at)}`
+            : '';
+        return h(
+          'tr',
+          null,
+          h('th', { scope: 'row', class: 'mono', text: delivery.type }),
+          h(
+            'td',
+            null,
+            h('span', { class: `status status-${delivery.status}`, text: delivery.status }),
+            delivery.attempts > 1 ? h('span', { class: 'meta-aside', text: ` · ${plural(delivery.attempts, 'attempt')}` }) : null,
+          ),
+          h('td', { class: 'delivery-answer', title: delivery.last_response || null, text: deliveryResult(delivery) + retry }),
+          h('td', { title: fullTime(when), text: relativeTime(when) }),
+          h(
+            'td',
+            { class: 'key-actions' },
+            delivery.status === 'pending' && delivery.attempts === 0
+              ? null
+              : h('button', { class: 'btn btn-quiet', type: 'button', onclick: () => replayDelivery(delivery) }, 'Replay'),
+          ),
+        );
+      }),
+    ),
+  );
+}
+
+function renderWebhooks() {
+  const root = $('webhooks-list');
+  if (!root) return;
+  if (!state.webhooks || state.webhooks.inbox !== state.view.id) {
+    root.replaceChildren(h('p', { class: 'hint', text: 'Loading…' }));
+    return;
+  }
+  const { list, deliveries } = state.webhooks;
+  fill(
+    root,
+    list.length
+      ? list.map((hook) =>
+          h(
+            'div',
+            { class: 'webhook' },
+            h(
+              'div',
+              { class: 'webhook-head' },
+              h('code', { class: 'webhook-endpoint', text: hook.endpoint }),
+              hook.enabled ? null : h('span', { class: 'tag', text: 'disabled' }),
+              h(
+                'span',
+                { class: 'webhook-actions' },
+                h('button', { class: 'btn btn-quiet', type: 'button', onclick: () => toggleWebhook(hook) }, hook.enabled ? 'Disable' : 'Enable'),
+                h('button', { class: 'btn btn-quiet btn-quiet-danger', type: 'button', onclick: () => deleteWebhook(hook) }, 'Delete'),
+              ),
+            ),
+            h('p', {
+              class: 'hint',
+              text: `Events: ${hook.events.length ? hook.events.join(', ') : 'all'}${hook.verify_tls ? '' : ' · any TLS certificate accepted'}`,
+            }),
+            h(
+              'div',
+              { class: 'fresh-key-row' },
+              h('code', { class: 'fresh-key-value', text: hook.secret }),
+              copyButton(hook.secret),
+            ),
+          ),
+        )
+      : h('p', {
+          class: 'hint',
+          text: 'No webhooks yet. Add your app’s webhook URL and it gets email.sent and email.delivered as mail arrives here.',
+        }),
+    deliveries.length ? [h('h4', { class: 'subhead', text: 'Latest deliveries' }), deliveryTable(deliveries)] : null,
+  );
+  clearTimeout(webhooksTimer);
+  if (sendingSoon(deliveries)) webhooksTimer = setTimeout(loadWebhooks, 1500);
+}
+
 function renderConnectPanel(root) {
   const id = state.view.id;
   const info = state.info;
@@ -1848,6 +2234,43 @@ function renderConnectPanel(root) {
             text: 'You are signed in with one of this inbox’s API keys. Creating and revoking keys takes the admin token.',
           }),
 
+      admin
+        ? h(
+            'section',
+            { class: 'panel-section', 'aria-labelledby': 'webhooks-title' },
+            h('h3', { id: 'webhooks-title', text: 'Webhooks' }),
+            h('p', {
+              class: 'hint webhooks-lead',
+              text:
+                'Events about this inbox’s mail, posted to your app and signed with the webhook’s own secret, ' +
+                'as Standard Webhooks describes. ' +
+                'Mail to bounced@, complained@ or suppressed@emailulator.test has that outcome; anything else is delivered. ' +
+                'Send any other event from a message’s Webhooks tab.',
+            }),
+            h('div', { id: 'webhooks-list' }),
+            h(
+              'form',
+              { class: 'key-form webhook-form', onsubmit: createWebhook },
+              h('label', { class: 'visually-hidden', for: 'webhook-endpoint', text: 'Webhook URL' }),
+              h('input', {
+                id: 'webhook-endpoint',
+                class: 'field',
+                type: 'url',
+                required: true,
+                autocomplete: 'off',
+                placeholder: 'http://localhost:8000/webhooks/email',
+              }),
+              h('button', { class: 'btn btn-primary', type: 'submit' }, icon('plus'), 'Add webhook'),
+              h(
+                'label',
+                { class: 'webhook-insecure' },
+                h('input', { id: 'webhook-insecure', type: 'checkbox' }),
+                ' Accept any TLS certificate, such as a self-signed one',
+              ),
+            ),
+          )
+        : null,
+
       h('section', { id: 'snippets', class: 'panel-section', 'aria-labelledby': 'snippets-title' }),
 
       admin && !isDefault
@@ -1862,6 +2285,7 @@ function renderConnectPanel(root) {
     ),
   );
   renderKeys();
+  renderWebhooks();
   renderSnippets();
 }
 

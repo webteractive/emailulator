@@ -47,13 +47,19 @@ that emails (a sign-up, a password reset, an invoice), call wait_for_message wit
 address in `to`, then read the body or the links it returns. Mail is kept in inboxes, one per \
 application. With an inbox's API key every tool works inside that inbox and the `inbox` argument \
 is unnecessary; with admin access, pass `inbox` to work in one or leave it out to span them all. \
-Search queries accept bare words and from:, to:, subject:, is:unread, is:starred, has:attachment.";
+Search queries accept bare words and from:, to:, subject:, is:unread, is:starred, has:attachment. \
+An inbox may have webhooks that receive events about its mail: email.sent and \
+email.delivered as it arrives (bounced@emailulator.test and the like have the outcome they name). \
+simulate_event reports any other event, such as a bounce or a click, and \
+list_webhook_deliveries shows what was sent and how the application answered.";
 
 const INBOX_ARG: &str = "The inbox to work in, by id or name. Needed only with admin access; an inbox API key is already confined to its own.";
 
 pub struct Mcp {
     store: Arc<Store>,
     max_message_size: usize,
+    /// SpamAssassin's spamd, as `host:port`, for a spam score in the check.
+    spamassassin: Option<String>,
 }
 
 fn tools() -> Value {
@@ -123,7 +129,7 @@ fn tools() -> Value {
         {
             "name": "check_message",
             "title": "Check email client support",
-            "description": "Report which email clients will not render a message as written: each HTML or CSS feature it uses that Gmail, Outlook, Apple Mail, Yahoo or Samsung Email lacks or only partly supports, with the platforms affected and why, plus notices such as Gmail clipping. Use it after changing an email template. It reads the markup; it does not render it.",
+            "description": "Report which email clients will not render a message as written, and how receivers are likely to treat it. `issues` lists each HTML or CSS feature it uses that Gmail, Outlook, Apple Mail, Yahoo or Samsung Email lacks or only partly supports, with the platforms affected and why; `notices` covers such things as Gmail clipping. `deliverability` lists findings worst first (status fail, warn, info or pass): DKIM signatures and their body hash, DMARC alignment, one-click unsubscribe, missing or odd headers, and links or images spam filters score. `spam` holds SpamAssassin's score and matched rules when the server has one, and is null otherwise. Use it after changing an email template. It reads the message; it does not render it or look anything up in DNS.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -220,6 +226,35 @@ fn tools() -> Value {
                 }
             },
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": true}
+        },
+        {
+            "name": "simulate_event",
+            "title": "Simulate a webhook event",
+            "description": "Report an event about a caught email to its inbox's webhooks: a bounce, a spam complaint, an open, a click and so on. Use it to test an application's webhook handler. Answers how many deliveries were queued: none when the inbox has no webhook that takes the event.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": ["integer", "string"], "description": "The message, by its id or its `em_` email id."},
+                    "type": {"type": "string", "enum": crate::webhook::EVENT_TYPES},
+                    "link": {"type": "string", "description": "For email.clicked: the link to report. The message's first link otherwise."}
+                },
+                "required": ["id", "type"]
+            },
+            "annotations": {"readOnlyHint": false, "destructiveHint": false}
+        },
+        {
+            "name": "list_webhook_deliveries",
+            "title": "List webhook deliveries",
+            "description": "The webhook events sent, or waiting to be sent, newest first: each one's type, payload, status (pending, succeeded or failed), attempts, and the HTTP status and start of the body the application answered with.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "inbox": {"type": "string", "description": INBOX_ARG},
+                    "id": {"type": ["integer", "string"], "description": "Only events about this message, by its id or its `em_` email id."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "How many to return. Default 20."}
+                }
+            },
+            "annotations": {"readOnlyHint": true}
         }
     ])
 }
@@ -233,7 +268,7 @@ fn rpc_result(id: Value, result: Value) -> Value {
 }
 
 /// Unix milliseconds as an RFC 3339 UTC timestamp.
-fn rfc3339(ms: i64) -> String {
+pub(crate) fn rfc3339(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
@@ -268,6 +303,15 @@ fn arg_i64(args: &Value, name: &str) -> Result<i64> {
         .ok_or_else(|| anyhow!("`{name}` is required and must be an integer"))
 }
 
+/// A message named by its row id or its `em_` email id.
+fn arg_message(args: &Value, name: &str) -> Result<String> {
+    match args.get(name) {
+        Some(Value::Number(n)) if n.is_i64() => Ok(n.to_string()),
+        Some(Value::String(text)) if !text.trim().is_empty() => Ok(text.trim().to_string()),
+        _ => bail!("`{name}` is required: a message id or `em_` email id"),
+    }
+}
+
 fn arg_str<'a>(args: &'a Value, name: &str) -> Option<&'a str> {
     args.get(name)
         .and_then(Value::as_str)
@@ -279,10 +323,11 @@ fn arg_bool(args: &Value, name: &str) -> bool {
 }
 
 impl Mcp {
-    pub fn new(store: Arc<Store>, max_message_size: usize) -> Self {
+    pub fn new(store: Arc<Store>, max_message_size: usize, spamassassin: Option<String>) -> Self {
         Self {
             store,
             max_message_size,
+            spamassassin,
         }
     }
 
@@ -456,6 +501,19 @@ impl Mcp {
         }
     }
 
+    /// The row id of a message an argument names, by row id or `em_` id,
+    /// refused as [`Self::authorize`] refuses one out of reach.
+    async fn message_ref(&self, access: &Access, args: &Value, name: &str) -> Result<i64> {
+        let text = arg_message(args, name)?;
+        let wanted = text.clone();
+        let id = self
+            .store(move |s| s.message_ref(&wanted))
+            .await?
+            .ok_or_else(|| anyhow!("no message with id {text}"))?;
+        self.authorize(access, id).await?;
+        Ok(id)
+    }
+
     async fn message(&self, id: i64, args: &Value) -> Result<Value> {
         let detail = self
             .store(move |s| s.get(id))
@@ -469,6 +527,7 @@ impl Mcp {
 
         let mut out = json!({
             "id": detail.summary.id,
+            "email_id": detail.summary.email_id,
             "inbox": detail.summary.inbox,
             "inbox_name": detail.summary.inbox_name,
             "received_at": rfc3339(detail.summary.received_at),
@@ -542,6 +601,7 @@ impl Mcp {
                     .map(|m| {
                         json!({
                             "id": m.id,
+                            "email_id": m.email_id,
                             "inbox": m.inbox,
                             "inbox_name": m.inbox_name,
                             "received_at": rfc3339(m.received_at),
@@ -624,8 +684,13 @@ impl Mcp {
             "check_message" => {
                 let id = arg_i64(args, "id")?;
                 self.authorize(access, id).await?;
-                let detail = self
-                    .store(move |s| s.get(id))
+                let (detail, raw) = self
+                    .store(move |s| {
+                        let Some(detail) = s.get(id)? else {
+                            return Ok(None);
+                        };
+                        Ok(Some((detail, s.raw(id)?.unwrap_or_default())))
+                    })
                     .await?
                     .ok_or_else(|| anyhow!("no message with id {id}"))?;
                 // An agent wants the clients that matter, not all twenty-two.
@@ -653,10 +718,15 @@ impl Mcp {
                 // The check reads hostile markup; keep it off the async threads,
                 // as the HTTP route does.
                 let has_html = detail.html.is_some();
-                let mut report = tokio::task::spawn_blocking(move || {
-                    crate::check::check(&detail, only.as_deref())
+                let (mut report, raw) = tokio::task::spawn_blocking(move || {
+                    let mut report = crate::check::check(&detail, only.as_deref());
+                    report.deliverability = crate::deliverability::check(&detail, &raw);
+                    (report, raw)
                 })
                 .await?;
+                if let Some(spamd) = &self.spamassassin {
+                    report.spam = Some(crate::deliverability::spamassassin(spamd, &raw).await);
+                }
                 let max = args.get("max_issues").and_then(Value::as_u64).unwrap_or(25) as usize;
                 let total = report.issues.len();
                 report.issues.truncate(max);
@@ -756,9 +826,12 @@ impl Mcp {
                     );
                 }
                 let summary = self.store(move |s| s.insert(incoming)).await?;
-                Ok(
-                    json!({"id": summary.id, "inbox": summary.inbox, "delivered_to": summary.recipients}),
-                )
+                Ok(json!({
+                    "id": summary.id,
+                    "email_id": summary.email_id,
+                    "inbox": summary.inbox,
+                    "delivered_to": summary.recipients
+                }))
             }
             "delete_messages" => {
                 if let Some(id) = args.get("id").and_then(Value::as_i64) {
@@ -783,6 +856,51 @@ impl Mcp {
                 };
                 let deleted = self.store(move |s| s.clear(&filter)).await?;
                 Ok(json!({"deleted": deleted}))
+            }
+            "simulate_event" => {
+                let id = self.message_ref(access, args, "id").await?;
+                let event = arg_str(args, "type")
+                    .ok_or_else(|| anyhow!("`type` is required, such as email.bounced"))?
+                    .to_string();
+                let detail = crate::webhook::Detail {
+                    link: arg_str(args, "link").map(str::to_string),
+                };
+                let name = event.clone();
+                let queued = self
+                    .store(move |s| s.simulate_event(id, &name, &detail))
+                    .await?;
+                let mut out = json!({"id": id, "type": event, "queued": queued});
+                if queued == 0 {
+                    out["note"] = json!(
+                        "no enabled webhook of this message's inbox takes this event, so nothing was sent"
+                    );
+                }
+                Ok(out)
+            }
+            "list_webhook_deliveries" => {
+                let inbox = self.scope(access, args).await?;
+                let email_id = match args.get("id") {
+                    Some(_) => {
+                        let id = self.message_ref(access, args, "id").await?;
+                        self.store(move |s| s.summary(id))
+                            .await?
+                            .map(|m| m.email_id)
+                    }
+                    None => None,
+                };
+                let filter = crate::store::DeliveryFilter {
+                    inbox,
+                    email_id,
+                    limit: Some(
+                        args.get("limit")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(20)
+                            .min(100) as usize,
+                    ),
+                    ..Default::default()
+                };
+                let deliveries = self.store(move |s| s.deliveries(&filter)).await?;
+                Ok(json!({"deliveries": deliveries}))
             }
             other => bail!("unknown tool: {other}"),
         }
@@ -827,7 +945,7 @@ mod tests {
 
     fn mcp() -> (Mcp, Arc<Store>) {
         let store = Arc::new(Store::in_memory().unwrap());
-        (Mcp::new(store.clone(), 1024 * 1024), store)
+        (Mcp::new(store.clone(), 1024 * 1024, None), store)
     }
 
     fn deliver_in(store: &Store, inbox: &str, to: &str, subject: &str, body: &str) -> i64 {
@@ -841,6 +959,7 @@ mod tests {
                 envelope_from: None,
                 envelope_to: vec![to.into()],
                 source: Source::Smtp,
+                tags: Default::default(),
             })
             .unwrap()
             .id
@@ -997,7 +1116,7 @@ mod tests {
             .await
             .unwrap();
         let tools = reply["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 13);
         for tool in tools {
             assert_eq!(tool["inputSchema"]["type"], "object", "{}", tool["name"]);
             assert!(tool["description"].as_str().unwrap().len() > 20);
@@ -1125,6 +1244,7 @@ mod tests {
                 envelope_from: None,
                 envelope_to: vec!["b@x.test".into()],
                 source: Source::Smtp,
+                tags: Default::default(),
             })
             .unwrap()
             .id;
@@ -1235,6 +1355,62 @@ mod tests {
         let (deleted, error) = call(&mcp, "delete_messages", json!({"all": true})).await;
         assert!(!error);
         assert_eq!(deleted["deleted"], 1);
+    }
+
+    #[tokio::test]
+    async fn simulates_events_and_lists_deliveries() {
+        let (mcp, store) = mcp();
+        let id = deliver(
+            &store,
+            "bob@x.test",
+            "Welcome",
+            "Verify at https://app.test/v/1",
+        );
+        let (out, error) = call(
+            &mcp,
+            "simulate_event",
+            json!({"id": id, "type": "email.bounced"}),
+        )
+        .await;
+        assert!(!error, "{out}");
+        assert_eq!(out["queued"], 0, "no webhook yet");
+
+        store
+            .create_webhook(crate::store::NewWebhook {
+                inbox: DEFAULT_INBOX.into(),
+                endpoint: "http://127.0.0.1:9/hook".into(),
+                events: vec![],
+                verify_tls: true,
+            })
+            .unwrap();
+        let email_id = store.summary(id).unwrap().unwrap().email_id;
+        let (out, error) = call(
+            &mcp,
+            "simulate_event",
+            json!({"id": email_id, "type": "email.clicked"}),
+        )
+        .await;
+        assert!(!error, "{out}");
+        assert_eq!(out["queued"], 1);
+        let (out, error) = call(
+            &mcp,
+            "simulate_event",
+            json!({"id": id, "type": "email.nope"}),
+        )
+        .await;
+        assert!(error, "{out}");
+
+        let (log, error) = call(&mcp, "list_webhook_deliveries", json!({"id": id})).await;
+        assert!(!error, "{log}");
+        let deliveries = log["deliveries"].as_array().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            deliveries[0]["payload"]["data"]["click"]["link"],
+            "https://app.test/v/1"
+        );
+
+        let (listed, _) = call(&mcp, "list_messages", json!({})).await;
+        assert_eq!(listed["messages"][0]["email_id"], email_id);
     }
 
     #[test]

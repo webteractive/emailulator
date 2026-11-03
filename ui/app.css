@@ -1617,6 +1617,123 @@ h3 {
   font-size: 12px;
 }
 
+/* ------------------------------------------------------------------ webhooks */
+
+.webhooks-lead {
+  margin-bottom: 10px;
+}
+
+.webhook {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--bg-raised);
+}
+
+.webhook-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.webhook-endpoint {
+  min-width: 0;
+  font: 12.5px/1.4 var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.webhook-actions {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.webhook-form {
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+.webhook-insecure {
+  display: flex;
+  flex-basis: 100%;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.webhook-insecure input { margin: 0; }
+
+.subhead {
+  margin: 14px 0 4px;
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.deliveries .mono {
+  font-family: var(--mono);
+  font-weight: 400;
+}
+
+.delivery-answer {
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
+.status {
+  font-weight: 600;
+}
+
+.status-succeeded {
+  color: var(--ok);
+}
+
+.status-pending {
+  color: var(--warn);
+}
+
+.status-failed {
+  color: var(--danger);
+}
+
+.webhooks-tab {
+  padding: 16px 20px 28px;
+}
+
+.webhooks-intro {
+  margin-bottom: 12px;
+}
+
+.webhooks-intro p + p {
+  margin-top: 4px;
+}
+
+.simulate {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  max-width: 640px;
+  margin-bottom: 14px;
+}
+
+.simulate label {
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
+.simulate select.field {
+  width: auto;
+}
+
+.simulate input.field {
+  flex: 1;
+  min-width: 200px;
+}
+
 .danger-zone {
   padding-top: 18px;
   border-top: 1px solid var(--border);
@@ -1878,6 +1995,88 @@ h3 {
 
 .check-count { color: var(--text-2); font-size: 12px; }
 
+.check-deliverability { margin: 0 0 26px; }
+
+.check-heading {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.check-findings {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.check-finding {
+  display: grid;
+  grid-template-columns: 7px 1fr;
+  column-gap: 10px;
+  row-gap: 2px;
+  padding: 9px 0;
+  border-top: 1px solid var(--border);
+  line-height: 1.45;
+}
+
+.check-finding::before {
+  content: "";
+  grid-row: 1;
+  align-self: center;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-3);
+}
+
+.check-finding-fail::before { background: var(--danger); }
+.check-finding-warn::before { background: var(--warn); }
+.check-finding-pass::before { background: var(--ok); }
+
+.check-finding-title { font-weight: 600; }
+
+.check-finding-message {
+  grid-column: 2;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
+.check-finding-pass .check-finding-message { font-size: 12px; }
+
+.check-spam { margin: 4px 0 10px; }
+
+.check-spam-score { margin: 0; color: var(--text-2); }
+
+.check-spam-num {
+  color: var(--ok);
+  font-size: 18px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.check-spam-warn .check-spam-num { color: var(--warn); }
+.check-spam-bad .check-spam-num { color: var(--danger); }
+
+.check-spam-rules { margin-top: 6px; }
+.check-spam-rules summary { cursor: pointer; color: var(--text-2); font-size: 12px; }
+
+.check-spam-rules ul {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.check-spam-rules li {
+  display: grid;
+  grid-template-columns: 3.5em minmax(0, 14em) 1fr;
+  gap: 10px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+
+.check-spam-points { font-variant-numeric: tabular-nums; text-align: right; }
+.check-spam-rule { font-family: var(--mono); overflow-wrap: anywhere; }
+
 .check-clients li {
   display: grid;
   grid-template-columns: 120px 1fr;
@@ -1912,4 +2111,6 @@ h3 {
   .check { padding: 14px 16px 24px; }
   .check-clients li { grid-template-columns: 1fr; }
   .check-notes { grid-column: 1; }
+  .check-spam-rules li { grid-template-columns: 3.5em 1fr; }
+  .check-spam-rules .check-where { grid-column: 2; }
 }

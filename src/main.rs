@@ -58,6 +58,16 @@ enum Command {
     /// Create, list and revoke the API keys of an inbox
     #[command(subcommand)]
     Key(KeyCommand),
+    /// Post an inbox's mail events to an application as signed webhooks
+    #[command(
+        subcommand,
+        long_about = "Post an inbox's mail events to an application as webhooks signed the \
+            Standard Webhooks way: email.sent and email.delivered as mail arrives, and any other \
+            event on demand from the web UI, the API or MCP. Mail to a test address, such as \
+            bounced@emailulator.test, has the outcome it names.\n\n\
+            These act on the store on this machine; a running server picks changes up at once."
+    )]
+    Webhook(WebhookCommand),
     /// Keep `emailulator run` running in the background on macOS, as a LaunchAgent
     #[command(
         subcommand,
@@ -179,6 +189,64 @@ enum KeyCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum WebhookCommand {
+    /// List webhooks, every inbox's or one's
+    List {
+        /// Only this inbox's webhooks, by its id or name
+        inbox: Option<String>,
+        #[command(flatten)]
+        output: ListArgs,
+    },
+    /// Add a webhook to an inbox and print its signing secret
+    #[command(after_help = "Example:\n  \
+            emailulator webhook add default http://localhost:8000/webhooks/email")]
+    Add {
+        /// The inbox whose events are sent, by its id or name
+        inbox: String,
+        /// The http or https URL to post events to
+        endpoint: String,
+        /// Event types to send, comma-separated, such as email.delivered,email.bounced
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "all",
+            value_name = "TYPES"
+        )]
+        events: Vec<String>,
+        /// Accept any certificate from an https endpoint, such as a self-signed one
+        #[arg(long)]
+        insecure: bool,
+        #[command(flatten)]
+        output: ListArgs,
+    },
+    /// Show a webhook, its signing secret and its latest deliveries
+    Show {
+        /// The webhook's id, as `webhook list` shows
+        id: String,
+        #[command(flatten)]
+        output: ListArgs,
+    },
+    /// Start sending events to a webhook again
+    Enable {
+        id: String,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Stop sending events to a webhook, keeping it and what is waiting for it
+    Disable {
+        id: String,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Delete a webhook with its delivery log
+    Remove {
+        id: String,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+}
+
 #[derive(Args, Clone)]
 struct ListArgs {
     #[command(flatten)]
@@ -196,6 +264,11 @@ struct McpArgs {
     /// all inboxes otherwise
     #[arg(long, env = "EMAILULATOR_INBOX", value_name = "INBOX")]
     inbox: Option<String>,
+
+    /// SpamAssassin's spamd, as HOST[:PORT] (port 783 by default), to add a
+    /// spam score to each message's check
+    #[arg(long, env = "EMAILULATOR_SPAMASSASSIN", value_name = "HOST:PORT", value_parser = parse_spamd)]
+    spamassassin: Option<String>,
 }
 
 #[derive(Args, Clone)]
@@ -217,6 +290,11 @@ struct AppArgs {
 
     #[command(flatten)]
     store: StoreArgs,
+
+    /// SpamAssassin's spamd, as HOST[:PORT] (port 783 by default), to add a
+    /// spam score to each message's check
+    #[arg(long, env = "EMAILULATOR_SPAMASSASSIN", value_name = "HOST:PORT", value_parser = parse_spamd)]
+    spamassassin: Option<String>,
 
     /// Stay attached to this terminal instead of returning once the app is open
     #[arg(long)]
@@ -367,6 +445,17 @@ struct RunArgs {
     #[arg(long, env = "EMAILULATOR_NO_UI", value_parser = BoolishValueParser::new())]
     no_ui: bool,
 
+    /// SpamAssassin's spamd, as HOST[:PORT] (port 783 by default), to add a
+    /// spam score to each message's check
+    #[arg(long, env = "EMAILULATOR_SPAMASSASSIN", value_name = "HOST:PORT", value_parser = parse_spamd)]
+    spamassassin: Option<String>,
+
+    /// Post webhooks to this machine and private networks even though the
+    /// server has an admin token or an exposed HTTP listener. Off, anyone who
+    /// may add a webhook could make the server probe the network it sits in
+    #[arg(long, env = "EMAILULATOR_ALLOW_PRIVATE_WEBHOOKS", value_parser = BoolishValueParser::new())]
+    allow_private_webhooks: bool,
+
     /// Log verbosity: error, warn, info, debug or trace
     #[arg(
         long,
@@ -388,6 +477,10 @@ fn parse_provision(value: &str) -> Result<(String, String), String> {
 
 /// A bare host name or address: the UI puts it in MAIL_HOST as it is, so a
 /// scheme, path or space would be copied into every app's configuration.
+fn parse_spamd(value: &str) -> Result<String, String> {
+    emailulator::deliverability::spamd_address(value).map_err(|error| error.to_string())
+}
+
 fn parse_host(value: &str) -> Result<String, String> {
     let host = value.trim();
     if host.is_empty() || host.contains(|c: char| c.is_whitespace() || c == '/') {
@@ -474,6 +567,8 @@ impl RunArgs {
                 .zip(self.tls_key)
                 .map(|(cert, key)| TlsFiles { cert, key }),
             ui: !self.no_ui,
+            spamassassin: self.spamassassin,
+            allow_private_webhooks: self.allow_private_webhooks,
         })
     }
 }
@@ -598,7 +693,11 @@ async fn mcp_stdio(args: McpArgs) -> Result<()> {
         None => Access::Admin,
     };
     mcp::serve_stdio(
-        Mcp::new(std::sync::Arc::new(store), 25 * 1024 * 1024),
+        Mcp::new(
+            std::sync::Arc::new(store),
+            25 * 1024 * 1024,
+            args.spamassassin,
+        ),
         access,
     )
     .await
@@ -772,6 +871,166 @@ fn key_command(command: KeyCommand) -> Result<()> {
     }
 }
 
+fn webhook_command(command: WebhookCommand) -> Result<()> {
+    use emailulator::store::{DeliveryFilter, NewWebhook};
+
+    let events = |hook: &emailulator::model::Webhook| {
+        if hook.events.is_empty() {
+            "all".to_string()
+        } else {
+            hook.events.join(",")
+        }
+    };
+    match command {
+        WebhookCommand::List { inbox, output } => {
+            let store = local_store(&output.store)?;
+            let inbox = inbox.map(|text| find_inbox(&store, &text)).transpose()?;
+            let hooks = store.webhooks(inbox.as_deref())?;
+            if output.json {
+                return print_json(&hooks);
+            }
+            if hooks.is_empty() {
+                println!("No webhooks yet. Add one with `emailulator webhook add <inbox> <url>`.");
+                return Ok(());
+            }
+            let width = hooks
+                .iter()
+                .map(|h| h.inbox.len())
+                .max()
+                .unwrap_or(5)
+                .max(5);
+            let types = hooks
+                .iter()
+                .map(|h| events(h).len())
+                .max()
+                .unwrap_or(6)
+                .max(6);
+            println!(
+                "{:<27}  {:<width$}  {:<8}  {:<types$}  ENDPOINT",
+                "ID", "INBOX", "STATE", "EVENTS"
+            );
+            for hook in &hooks {
+                let state = if hook.enabled { "enabled" } else { "disabled" };
+                println!(
+                    "{:<27}  {:<width$}  {:<8}  {:<types$}  {}",
+                    hook.id,
+                    hook.inbox,
+                    state,
+                    events(hook),
+                    hook.endpoint
+                );
+            }
+            println!(
+                "\nSee one's secret and deliveries with `emailulator webhook show <id>`. For scripts: add --json."
+            );
+            Ok(())
+        }
+        WebhookCommand::Add {
+            inbox,
+            endpoint,
+            events: wanted,
+            insecure,
+            output,
+        } => {
+            let store = local_store(&output.store)?;
+            let inbox = find_inbox(&store, &inbox)?;
+            let hook = store.create_webhook(NewWebhook {
+                inbox,
+                endpoint,
+                events: wanted,
+                verify_tls: !insecure,
+            })?;
+            if output.json {
+                return print_json(&hook);
+            }
+            println!("Added webhook {} for the {} inbox.\n", hook.id, hook.inbox);
+            println!("Endpoint  {}", hook.endpoint);
+            println!("Events    {}", events(&hook));
+            println!("Secret    {}", hook.secret);
+            println!("\nThe application checks the webhook-signature header with the secret.");
+            Ok(())
+        }
+        WebhookCommand::Show { id, output } => {
+            let store = local_store(&output.store)?;
+            let Some(hook) = store.webhook(&id)? else {
+                bail!("there is no webhook `{id}`; see `emailulator webhook list`");
+            };
+            let deliveries = store.deliveries(&DeliveryFilter {
+                webhook: Some(id),
+                limit: Some(10),
+                ..Default::default()
+            })?;
+            if output.json {
+                let mut value = serde_json::to_value(&hook)?;
+                value["deliveries"] = serde_json::to_value(&deliveries)?;
+                return print_json(&value);
+            }
+            println!("Webhook   {}", hook.id);
+            println!("Inbox     {}", hook.inbox);
+            println!("Endpoint  {}", hook.endpoint);
+            println!("Events    {}", events(&hook));
+            println!(
+                "State     {}{}",
+                if hook.enabled { "enabled" } else { "disabled" },
+                if hook.verify_tls {
+                    ""
+                } else {
+                    ", any TLS certificate accepted"
+                }
+            );
+            println!("Secret    {}", hook.secret);
+            if deliveries.is_empty() {
+                println!(
+                    "\nNothing sent yet. Mail arriving in the inbox sends its events here as it comes."
+                );
+                return Ok(());
+            }
+            println!(
+                "\n{:<27}  {:<22}  {:<9}  {:>8}  RESULT",
+                "DELIVERY", "TYPE", "STATUS", "ATTEMPTS"
+            );
+            for delivery in &deliveries {
+                let result = match (delivery.last_status, &delivery.last_error) {
+                    (Some(status), _) => format!("HTTP {status}"),
+                    (None, Some(error)) => error.clone(),
+                    (None, None) => "waiting".to_string(),
+                };
+                println!(
+                    "{:<27}  {:<22}  {:<9}  {:>8}  {}",
+                    delivery.id, delivery.event, delivery.status, delivery.attempts, result
+                );
+            }
+            println!("\nFor scripts: add --json.");
+            Ok(())
+        }
+        WebhookCommand::Enable { id, store } => set_webhook_enabled(&id, &store, true),
+        WebhookCommand::Disable { id, store } => set_webhook_enabled(&id, &store, false),
+        WebhookCommand::Remove { id, store } => {
+            if !local_store(&store)?.delete_webhook(&id)? {
+                bail!("there is no webhook `{id}`; see `emailulator webhook list`");
+            }
+            println!("Removed webhook {id} and its delivery log.");
+            Ok(())
+        }
+    }
+}
+
+fn set_webhook_enabled(id: &str, store: &StoreArgs, enabled: bool) -> Result<()> {
+    let hook = local_store(store)?.update_webhook(
+        id,
+        emailulator::store::WebhookChanges {
+            enabled: Some(enabled),
+            ..Default::default()
+        },
+    )?;
+    println!(
+        "Webhook {} is {}.",
+        hook.id,
+        if hook.enabled { "enabled" } else { "disabled" }
+    );
+    Ok(())
+}
+
 /// Open the desktop app, which is compiled into this binary when it is built
 /// with the `desktop` feature on macOS or Windows.
 #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
@@ -781,6 +1040,7 @@ fn open_app(args: AppArgs) -> Result<()> {
             smtp_addr: args.smtp_addr,
             http_addr: args.http_addr,
             data_dir: args.store.data_dir,
+            spamassassin: args.spamassassin,
         });
         return Ok(());
     }
@@ -799,6 +1059,9 @@ fn open_app(args: AppArgs) -> Result<()> {
     }
     if let Some(dir) = &args.store.data_dir {
         command.arg("--data-dir").arg(dir);
+    }
+    if let Some(spamd) = &args.spamassassin {
+        command.arg("--spamassassin").arg(spamd);
     }
     command
         .stdin(Stdio::null())
@@ -860,6 +1123,7 @@ async fn run(command: Command) -> Result<()> {
         Command::App(args) => open_app(args),
         Command::Inbox(command) => inbox_command(command),
         Command::Key(command) => key_command(command),
+        Command::Webhook(command) => webhook_command(command),
         Command::Mcp(args) => mcp_stdio(args).await,
         Command::Token => {
             println!("{}", security::generate_token());

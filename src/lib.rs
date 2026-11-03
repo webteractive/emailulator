@@ -6,6 +6,7 @@
 
 pub mod check;
 pub mod compose;
+pub mod deliverability;
 pub mod http;
 pub mod mcp;
 pub mod model;
@@ -14,6 +15,7 @@ pub mod security;
 pub mod smtp;
 pub mod store;
 pub mod update;
+pub mod webhook;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -76,6 +78,11 @@ pub struct Config {
     /// Enables HTTPS and SMTP STARTTLS.
     pub tls: Option<TlsFiles>,
     pub ui: bool,
+    /// SpamAssassin's spamd, as `host:port`, for a spam score in the check.
+    pub spamassassin: Option<String>,
+    /// Let webhooks be posted to this machine and private networks although
+    /// the server is reachable by others. See [`Config::webhooks_reach_private`].
+    pub allow_private_webhooks: bool,
 }
 
 impl Default for Config {
@@ -94,6 +101,8 @@ impl Default for Config {
             smtp_host: None,
             tls: None,
             ui: true,
+            spamassassin: None,
+            allow_private_webhooks: false,
         }
     }
 }
@@ -105,6 +114,18 @@ impl Config {
     /// outright that the network is trusted.
     pub fn smtp_requires_auth(&self) -> bool {
         !self.smtp_addr.ip().is_loopback() && !self.allow_anonymous_smtp
+    }
+
+    /// Whether webhooks may be posted to this machine and private networks.
+    /// A loopback listener with no admin token is one developer's own server,
+    /// and posting to the application next to it is the point. With a token,
+    /// or on an exposed listener, others may reach it, and anyone who may add
+    /// a webhook could make the server probe its own network: a reverse proxy
+    /// on the same machine serves the public from a loopback listener. There
+    /// it must be asked for.
+    pub fn webhooks_reach_private(&self) -> bool {
+        (self.http_addr.ip().is_loopback() && self.auth_token.is_none())
+            || self.allow_private_webhooks
     }
 
     /// The host the web UI gives applications for SMTP: the one configured,
@@ -205,6 +226,7 @@ pub struct Emailulator {
     smtp_config: SmtpConfig,
     http_config: HttpConfig,
     http_tls: Option<TlsAcceptor>,
+    webhooks: webhook::client::Policy,
     warnings: Vec<String>,
 }
 
@@ -276,8 +298,12 @@ impl Emailulator {
                 info,
                 ui: config.ui,
                 loopback: config.http_addr.ip().is_loopback(),
+                spamassassin: config.spamassassin.clone(),
             },
             http_tls,
+            webhooks: webhook::client::Policy {
+                allow_private: config.webhooks_reach_private(),
+            },
             warnings,
         })
     }
@@ -309,6 +335,7 @@ impl Emailulator {
     /// Serve until either listener fails.
     pub async fn serve(self) -> Result<()> {
         let router = http::router(self.store.clone(), self.http_config);
+        tokio::spawn(webhook::worker::run(self.store.clone(), self.webhooks));
         tokio::select! {
             result = smtp::serve(self.smtp, self.store, self.smtp_config) => result.context("SMTP server stopped"),
             result = http::serve(self.http, self.http_tls, router) => result.context("HTTP server stopped"),
@@ -361,6 +388,25 @@ mod tests {
         assert!(config.smtp_requires_auth());
         config.allow_anonymous_smtp = true;
         assert!(!config.smtp_requires_auth());
+    }
+
+    #[test]
+    fn private_webhooks_are_for_an_unprotected_local_server() {
+        let mut config = Config {
+            data_dir: None,
+            ..Config::default()
+        };
+        assert!(config.webhooks_reach_private(), "this machine only");
+
+        // Behind a proxy on the same machine the listener is loopback too.
+        config.auth_token = Some(security::generate_token());
+        assert!(!config.webhooks_reach_private());
+        config.allow_private_webhooks = true;
+        assert!(config.webhooks_reach_private());
+
+        let mut config = exposed();
+        config.allow_anonymous_http = true;
+        assert!(!config.webhooks_reach_private());
     }
 
     #[test]

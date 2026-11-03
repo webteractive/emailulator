@@ -1,5 +1,7 @@
 //! Types shared by the store, the HTTP API, the MCP server and the desktop app.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +73,9 @@ pub struct Header {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageSummary {
     pub id: i64,
+    /// The message's public id, `em_` and 24 letters and digits: what webhook
+    /// events carry as `email_id`, and accepted wherever a message id is.
+    pub email_id: String,
     /// Unix milliseconds at which the catcher accepted the message.
     pub received_at: i64,
     pub from: Option<Address>,
@@ -106,6 +111,8 @@ pub struct MessageDetail {
     pub html: Option<String>,
     pub headers: Vec<Header>,
     pub attachments: Vec<AttachmentMeta>,
+    /// Tags the sender attached, carried into the message's webhook events.
+    pub tags: BTreeMap<String, String>,
 }
 
 /// A named container for one application's mail, with its own API keys.
@@ -140,6 +147,54 @@ pub struct ApiKey {
     /// The key itself, for the starter key only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+}
+
+/// Where an inbox's events are sent, signed as Standard Webhooks describes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Webhook {
+    /// `we_` and 24 letters and digits.
+    pub id: String,
+    pub inbox: String,
+    /// The http or https URL events are posted to.
+    pub endpoint: String,
+    /// The event types sent, such as `email.delivered`; empty for all of them.
+    pub events: Vec<String>,
+    pub enabled: bool,
+    /// Whether an https endpoint's certificate must be one this machine trusts.
+    pub verify_tls: bool,
+    /// The signing secret, `whsec_` and base64. Kept readable: the application
+    /// receiving the events needs it to check their signatures.
+    pub secret: String,
+    pub created_at: i64,
+}
+
+/// One event on its way to one webhook, and how sending it has gone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Delivery {
+    /// `msg_` and 24 letters and digits, sent as `webhook-id`. It stays the same
+    /// across retries and replays, so a receiver can tell a repeat.
+    pub id: String,
+    pub webhook: String,
+    pub inbox: String,
+    /// The message the event is about.
+    pub email_id: Option<String>,
+    /// The event type, such as `email.delivered`.
+    #[serde(rename = "type")]
+    pub event: String,
+    /// `pending` while it waits to be sent or retried, then `succeeded` or `failed`.
+    pub status: String,
+    pub attempts: u32,
+    pub next_attempt_at: Option<i64>,
+    pub last_attempt_at: Option<i64>,
+    /// The HTTP status of the last answer, when there was one.
+    pub last_status: Option<u16>,
+    /// Why the last attempt failed, when it did.
+    pub last_error: Option<String>,
+    /// The start of the last answer's body.
+    pub last_response: Option<String>,
+    pub created_at: i64,
+    /// The JSON body that is posted.
+    pub payload: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

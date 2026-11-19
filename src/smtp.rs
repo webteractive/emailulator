@@ -28,9 +28,17 @@ const MAX_COMMAND_LINE: usize = 4096;
 const MAX_ERRORS: usize = 10;
 const MAX_AUTH_FAILURES: usize = 3;
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
-/// Addresses remembered for failed logins. Past this, new addresses go
-/// untracked rather than memory growing without bound.
-const MAX_TRACKED_PEERS: usize = 10_000;
+/// Failure counts remembered at once. Past this, the oldest count that has
+/// not locked anything out makes room; a lockout is never forgotten early.
+const MAX_TRACKED_FAILURES: usize = 10_000;
+/// An address's failures across every inbox may reach this many times the
+/// per-inbox limit, so rotating inbox ids gains little.
+const ADDRESS_FAILURE_FACTOR: usize = 5;
+/// An IPv6 /48's failures across its /64s may reach this many times the
+/// per-inbox limit, so hopping between /64s gains little.
+const SITE_FAILURE_FACTOR: usize = 20;
+/// The part of a claimed inbox id kept as a key, so a long one costs nothing.
+const MAX_USER_KEY: usize = 64;
 const LOCKED_OUT: &str = "421 4.7.0 Too many failed authentication attempts, try again later";
 
 pub struct SmtpConfig {
@@ -49,9 +57,11 @@ pub struct SmtpConfig {
     pub data_timeout: Duration,
     /// Pause after a failed AUTH, to slow password guessing.
     pub auth_failure_delay: Duration,
-    /// Failed AUTH attempts one public address may make, across all its
-    /// connections, before it is refused for the rest of `auth_lockout`.
-    pub max_auth_failures_per_ip: usize,
+    /// Failed AUTH attempts one address may make against one inbox id, over
+    /// any number of connections, before that pair is refused for the rest of
+    /// `auth_lockout`. The address as a whole, and an IPv6 /48, may fail a
+    /// few times more often across inbox ids before they are refused too.
+    pub max_auth_failures: usize,
     pub auth_lockout: Duration,
     /// When set, a client must authenticate as an inbox before sending: the
     /// inbox id as username, one of its API keys as password. When clear,
@@ -72,7 +82,7 @@ impl Default for SmtpConfig {
             idle_timeout: Duration::from_secs(120),
             data_timeout: Duration::from_secs(600),
             auth_failure_delay: Duration::from_secs(1),
-            max_auth_failures_per_ip: 10,
+            max_auth_failures: 10,
             auth_lockout: Duration::from_secs(15 * 60),
             require_auth: false,
             tls: None,
@@ -96,12 +106,33 @@ struct Context {
 #[derive(Default)]
 struct Peers {
     connections: Mutex<HashMap<IpAddr, usize>>,
-    failures: Mutex<HashMap<IpAddr, Failures>>,
+    failures: Mutex<HashMap<Bucket, Failures>>,
+}
+
+/// What a failed login counts against. Each has its own limit, and reaching
+/// any one of them locks that bucket out.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Bucket {
+    /// One address trying one inbox id. The tightest limit, and the one that
+    /// a neighbour behind the same NAT reaches by failing against their own
+    /// inbox, so it shuts out only that inbox from that address.
+    Login(IpAddr, String),
+    /// One address, whichever inbox ids it names.
+    Address(IpAddr),
+    /// An IPv6 /48, which one site commonly holds, across its /64s.
+    Site(IpAddr),
 }
 
 struct Failures {
     count: usize,
+    limit: usize,
     since: Instant,
+}
+
+impl Failures {
+    fn locked(&self, window: Duration) -> bool {
+        self.count >= self.limit && self.since.elapsed() < window
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -138,6 +169,26 @@ fn peer_key(ip: IpAddr) -> Option<IpAddr> {
         }
         v4 => v4,
     })
+}
+
+/// The buckets a failed login from `ip`, naming `user` when known, counts
+/// against, each with its limit. None for the operator's own networks.
+fn buckets(ip: IpAddr, user: Option<&str>, max: usize) -> Vec<(Bucket, usize)> {
+    let Some(address) = peer_key(ip) else {
+        return Vec::new();
+    };
+    let max = max.max(1);
+    let mut buckets = vec![(Bucket::Address(address), max * ADDRESS_FAILURE_FACTOR)];
+    if let IpAddr::V6(v6) = address {
+        let s = v6.segments();
+        let site = IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], 0, 0, 0, 0, 0));
+        buckets.push((Bucket::Site(site), max * SITE_FAILURE_FACTOR));
+    }
+    if let Some(user) = user {
+        let user: String = user.chars().take(MAX_USER_KEY).collect();
+        buckets.push((Bucket::Login(address, user), max));
+    }
+    buckets
 }
 
 /// One connection's place in its address's count, given back on drop.
@@ -177,40 +228,68 @@ impl Peers {
         })
     }
 
-    fn locked_out(&self, ip: IpAddr, config: &SmtpConfig) -> bool {
-        let Some(key) = peer_key(ip) else {
-            return false;
-        };
-        lock(&self.failures).get(&key).is_some_and(|f| {
-            f.count >= config.max_auth_failures_per_ip && f.since.elapsed() < config.auth_lockout
-        })
+    /// Whether `ip` is locked out: as a whole, or, when `user` is given, for
+    /// that inbox id.
+    fn locked_out(&self, ip: IpAddr, user: Option<&str>, config: &SmtpConfig) -> bool {
+        let failures = lock(&self.failures);
+        buckets(ip, user, config.max_auth_failures)
+            .iter()
+            .any(|(bucket, _)| {
+                failures
+                    .get(bucket)
+                    .is_some_and(|f| f.locked(config.auth_lockout))
+            })
     }
 
-    /// Count a failed login from `ip`; `true` once that locks the address out.
-    fn record_failure(&self, ip: IpAddr, config: &SmtpConfig) -> bool {
-        let Some(key) = peer_key(ip) else {
-            return false;
-        };
+    /// Count a failed login; `true` once that locks something out.
+    fn record_failure(&self, ip: IpAddr, user: Option<&str>, config: &SmtpConfig) -> bool {
+        let window = config.auth_lockout;
         let now = Instant::now();
         let mut failures = lock(&self.failures);
-        if !failures.contains_key(&key) && failures.len() >= MAX_TRACKED_PEERS {
-            failures.retain(|_, f| now.duration_since(f.since) < config.auth_lockout);
-            if failures.len() >= MAX_TRACKED_PEERS {
-                return false;
+        let mut locked = false;
+        for (bucket, limit) in buckets(ip, user, config.max_auth_failures) {
+            if !failures.contains_key(&bucket) && !make_room(&mut failures, window) {
+                continue;
             }
-        }
-        let entry = failures.entry(key).or_insert(Failures {
-            count: 0,
-            since: now,
-        });
-        if now.duration_since(entry.since) >= config.auth_lockout {
-            *entry = Failures {
+            let entry = failures.entry(bucket).or_insert(Failures {
                 count: 0,
+                limit,
                 since: now,
-            };
+            });
+            if now.duration_since(entry.since) >= window {
+                entry.count = 0;
+                entry.since = now;
+            }
+            entry.count += 1;
+            locked |= entry.count >= entry.limit;
         }
-        entry.count += 1;
-        entry.count >= config.max_auth_failures_per_ip
+        locked
+    }
+}
+
+/// Make room for one more failure count, if the table is full: first by
+/// dropping expired counts, then the oldest that has locked nothing out.
+/// Returns `false` only when every count is a live lockout.
+fn make_room(failures: &mut HashMap<Bucket, Failures>, window: Duration) -> bool {
+    if failures.len() < MAX_TRACKED_FAILURES {
+        return true;
+    }
+    let now = Instant::now();
+    failures.retain(|_, f| now.duration_since(f.since) < window);
+    if failures.len() < MAX_TRACKED_FAILURES {
+        return true;
+    }
+    let oldest = failures
+        .iter()
+        .filter(|(_, f)| f.count < f.limit)
+        .min_by_key(|(_, f)| f.since)
+        .map(|(bucket, _)| bucket.clone());
+    match oldest {
+        Some(bucket) => {
+            failures.remove(&bucket);
+            true
+        }
+        None => false,
     }
 }
 
@@ -239,7 +318,7 @@ pub async fn serve(listener: TcpListener, store: Arc<Store>, config: SmtpConfig)
                 continue;
             }
         };
-        if context.peers.locked_out(peer.ip(), &context.config) {
+        if context.peers.locked_out(peer.ip(), None, &context.config) {
             refuse(stream, LOCKED_OUT);
             continue;
         }
@@ -458,16 +537,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<'_, S> {
                 .await?;
             return Ok(true);
         }
-        // Checked here as well as on connecting, so connections opened before
-        // the lockout cannot keep guessing.
-        if self
-            .context
-            .peers
-            .locked_out(self.peer.ip(), &self.context.config)
-        {
-            self.reply(LOCKED_OUT).await?;
-            return Ok(false);
-        }
         let (mechanism, initial) = args.split_once(' ').unwrap_or((args, ""));
         let decode = |value: &str| BASE64.decode(value.trim()).ok();
 
@@ -521,6 +590,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<'_, S> {
                 .await?;
             return Ok(true);
         };
+        // Checked here as well as on connecting, so connections opened before
+        // a lockout cannot keep guessing, and an inbox locked out for this
+        // address is refused even with the right key.
+        let ip = self.peer.ip().to_canonical();
+        if self
+            .context
+            .peers
+            .locked_out(ip, Some(&user), &self.context.config)
+        {
+            self.reply(LOCKED_OUT).await?;
+            return Ok(false);
+        }
 
         // The username names an inbox and the password is one of its keys.
         let store = self.context.store.clone();
@@ -558,11 +639,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<'_, S> {
         self.auth_failures += 1;
         // One stable line per failure, naming the address and nothing the
         // client typed, so a log watcher such as fail2ban can match it.
-        let ip = self.peer.ip().to_canonical();
         tracing::warn!(%ip, "SMTP authentication failed");
-        let locked_out = self.context.peers.record_failure(ip, &self.context.config);
+        let locked_out = self
+            .context
+            .peers
+            .record_failure(ip, Some(&user), &self.context.config);
         if locked_out {
-            tracing::warn!(%ip, "SMTP address locked out after repeated authentication failures");
+            tracing::warn!(%ip, "SMTP logins locked out after repeated failures");
         }
         tokio::time::sleep(self.context.config.auth_failure_delay).await;
         if locked_out || self.auth_failures >= MAX_AUTH_FAILURES {
@@ -1115,56 +1198,133 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn locks_out_an_address_that_keeps_failing_across_connections() {
+    async fn locks_out_an_inbox_that_keeps_failing_from_one_address() {
         let (context, store) = context(SmtpConfig {
             require_auth: true,
             auth_failure_delay: Duration::ZERO,
-            max_auth_failures_per_ip: 4,
+            max_auth_failures: 4,
             ..SmtpConfig::default()
         });
         store.create_inbox("billing").unwrap();
+        store.create_inbox("marketing").unwrap();
         let (_, key) = store.create_key("billing", "app").unwrap();
+        let (_, other_key) = store.create_key("marketing", "app").unwrap();
         let wrong = format!("AUTH PLAIN {}\r\n", plain("billing", "wrong"));
         let right = format!("AUTH PLAIN {}\r\n{BODY}", plain("billing", &key));
 
         let reply = converse_as(&context, "1.1.1.1:40000", &wrong.repeat(3)).await;
         assert_eq!(reply.matches("535 5.7.8").count(), 2, "{reply}");
-        // The fourth failure, on a fresh connection, locks the address.
+        // The fourth failure, on a fresh connection, locks that inbox out.
         let reply = converse_as(&context, "1.1.1.1:40001", &wrong).await;
         assert!(reply.starts_with(LOCKED_OUT), "{reply}");
-        // Now even the right key is turned away from that address,
+        // Now even the right key for it is turned away from that address,
         let reply = converse_as(&context, "1.1.1.1:40002", &right).await;
         assert!(reply.starts_with(LOCKED_OUT), "{reply}");
-        assert!(
-            context
-                .peers
-                .locked_out("1.1.1.1".parse().unwrap(), &context.config)
-        );
-        // but not from another,
+        // but another inbox at the same address, say a neighbour behind the
+        // same NAT, is not,
+        let script = format!("AUTH PLAIN {}\r\n{BODY}", plain("marketing", &other_key));
+        let reply = converse_as(&context, "1.1.1.1:40003", &script).await;
+        assert!(reply.contains("235 2.7.0"), "{reply}");
+        // and the address may still connect.
+        let ip: IpAddr = "1.1.1.1".parse().unwrap();
+        assert!(!context.peers.locked_out(ip, None, &context.config));
+        // Nor is the inbox locked out from another address,
         let reply = converse_as(&context, "9.9.9.9:40000", &right).await;
         assert!(reply.contains("235 2.7.0"), "{reply}");
-        // nor from a private network, which is the operator's own.
+        // or from a private network, which is the operator's own.
         converse_as(&context, "10.0.0.5:40000", &wrong.repeat(3)).await;
         converse_as(&context, "10.0.0.5:40001", &wrong.repeat(3)).await;
         let reply = converse_as(&context, "10.0.0.5:40002", &right).await;
         assert!(reply.contains("235 2.7.0"), "{reply}");
         assert_eq!(store.stats(Some("billing")).unwrap().total, 2);
+        assert_eq!(store.stats(Some("marketing")).unwrap().total, 1);
+    }
+
+    #[tokio::test]
+    async fn rotating_inbox_ids_or_ipv6_addresses_still_hits_a_limit() {
+        let config = SmtpConfig {
+            max_auth_failures: 2,
+            ..SmtpConfig::default()
+        };
+        let peers = Peers::default();
+
+        // A new inbox id for every guess: the address is locked out after
+        // ADDRESS_FAILURE_FACTOR times the per-inbox limit, and then cannot
+        // even connect.
+        let ip: IpAddr = "1.1.1.1".parse().unwrap();
+        let limit = 2 * ADDRESS_FAILURE_FACTOR;
+        for n in 1..limit {
+            assert!(!peers.record_failure(ip, Some(&format!("inbox{n}")), &config));
+        }
+        assert!(peers.record_failure(ip, Some("one-more"), &config));
+        assert!(peers.locked_out(ip, None, &config));
+
+        // A new /64 for every guess: the /48 is locked out after
+        // SITE_FAILURE_FACTOR times the per-inbox limit.
+        let limit = 2 * SITE_FAILURE_FACTOR;
+        let in_site = |n: usize| -> IpAddr { format!("2606:4700:10:{n:x}::1").parse().unwrap() };
+        for n in 1..limit {
+            assert!(!peers.record_failure(in_site(n), Some("billing"), &config));
+        }
+        assert!(peers.record_failure(in_site(limit), Some("billing"), &config));
+        assert!(
+            peers.locked_out(in_site(0xffff), None, &config),
+            "a fresh /64 in that /48"
+        );
+        let elsewhere: IpAddr = "2606:4700:11::1".parse().unwrap();
+        assert!(!peers.locked_out(elsewhere, None, &config));
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_lockout_ends_after_its_window() {
         let config = SmtpConfig {
-            max_auth_failures_per_ip: 2,
+            max_auth_failures: 2,
             ..SmtpConfig::default()
         };
         let peers = Peers::default();
         let ip: IpAddr = "1.1.1.1".parse().unwrap();
-        assert!(!peers.record_failure(ip, &config));
-        assert!(peers.record_failure(ip, &config));
-        assert!(peers.locked_out(ip, &config));
+        let user = Some("billing");
+        assert!(!peers.record_failure(ip, user, &config));
+        assert!(peers.record_failure(ip, user, &config));
+        assert!(peers.locked_out(ip, user, &config));
         tokio::time::advance(config.auth_lockout).await;
-        assert!(!peers.locked_out(ip, &config));
-        assert!(!peers.record_failure(ip, &config), "a fresh window");
+        assert!(!peers.locked_out(ip, user, &config));
+        assert!(!peers.record_failure(ip, user, &config), "a fresh window");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_table_forgets_the_oldest_count_never_a_lockout() {
+        let config = SmtpConfig {
+            max_auth_failures: 1,
+            ..SmtpConfig::default()
+        };
+        let peers = Peers::default();
+        let address = |n: u32| IpAddr::V4(std::net::Ipv4Addr::from(0x0B00_0000 + n));
+        // An address locked out first, so it is also the oldest entry.
+        let locked = address(0);
+        for _ in 0..ADDRESS_FAILURE_FACTOR {
+            peers.record_failure(locked, None, &config);
+        }
+        assert!(peers.locked_out(locked, None, &config));
+        // Then fill the table with counts that lock nothing out.
+        for n in 1..MAX_TRACKED_FAILURES as u32 {
+            tokio::time::advance(Duration::from_millis(1)).await;
+            peers.record_failure(address(n), None, &config);
+        }
+        assert_eq!(lock(&peers.failures).len(), MAX_TRACKED_FAILURES);
+
+        // A newcomer is still counted, and the lockout survives.
+        let newcomer = address(MAX_TRACKED_FAILURES as u32);
+        for _ in 0..ADDRESS_FAILURE_FACTOR {
+            peers.record_failure(newcomer, None, &config);
+        }
+        assert!(peers.locked_out(newcomer, None, &config));
+        assert!(peers.locked_out(locked, None, &config));
+        assert_eq!(lock(&peers.failures).len(), MAX_TRACKED_FAILURES);
+        assert!(
+            !lock(&peers.failures).contains_key(&Bucket::Address(address(1))),
+            "the oldest count that locked nothing out made room"
+        );
     }
 
     #[test]

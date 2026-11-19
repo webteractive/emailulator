@@ -383,9 +383,13 @@ whoever sends it. The design assumes both.
   `Secure` over HTTPS; the credential never reaches the browser. They end on
   sign-out, after seven days, or on restart.
 - **Guessing is slowed.** The admin token is compared in constant time, failed
-  sign-ins are delayed, and three bad SMTP logins close the connection. A
-  public address that fails ten SMTP logins, over any number of connections, is
-  refused for 15 minutes. Each failure is logged as one line,
+  sign-ins are delayed, and three bad SMTP logins close the connection. Ten
+  failed SMTP logins for one inbox from one address, over any number of
+  connections, refuse that inbox from that address for 15 minutes. Fifty
+  failures across inboxes refuse the address altogether, as do 200 across one
+  IPv6 /48, so someone sharing your address, behind the same NAT for instance,
+  has to fail fifty times to shut your inbox out from it.
+  Each failure is logged as one line,
   `WARN SMTP authentication failed ip=<address>`, for fail2ban or similar. With
   TLS, SMTP accepts `AUTH` only after `STARTTLS`, even from a client that sends
   it unprompted.

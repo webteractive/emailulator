@@ -4,8 +4,9 @@
 //! onward. Supports the extensions real mailers probe for — SIZE, 8BITMIME,
 //! SMTPUTF8, PIPELINING, AUTH PLAIN/LOGIN and STARTTLS.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -14,6 +15,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
+use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 
 use crate::compose::valid_address;
@@ -22,9 +24,14 @@ use crate::security::API_KEY_PREFIX;
 use crate::store::{DEFAULT_INBOX, Incoming, Store};
 
 const MAX_COMMAND_LINE: usize = 4096;
-const MAX_BAD_COMMANDS: usize = 10;
+/// Commands refused with a permanent (5xx) error before the client is dropped.
+const MAX_ERRORS: usize = 10;
 const MAX_AUTH_FAILURES: usize = 3;
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Addresses remembered for failed logins. Past this, new addresses go
+/// untracked rather than memory growing without bound.
+const MAX_TRACKED_PEERS: usize = 10_000;
+const LOCKED_OUT: &str = "421 4.7.0 Too many failed authentication attempts, try again later";
 
 pub struct SmtpConfig {
     /// Name given in the greeting.
@@ -32,9 +39,20 @@ pub struct SmtpConfig {
     pub max_message_size: usize,
     pub max_recipients: usize,
     pub max_connections: usize,
+    /// Connections one public address may hold at once.
+    pub max_connections_per_ip: usize,
+    /// How long a client may stay silent mid-command, and the longest one
+    /// command line may take to arrive.
     pub idle_timeout: Duration,
+    /// The longest a message body may take to arrive, however steadily it is
+    /// sent.
+    pub data_timeout: Duration,
     /// Pause after a failed AUTH, to slow password guessing.
     pub auth_failure_delay: Duration,
+    /// Failed AUTH attempts one public address may make, across all its
+    /// connections, before it is refused for the rest of `auth_lockout`.
+    pub max_auth_failures_per_ip: usize,
+    pub auth_lockout: Duration,
     /// When set, a client must authenticate as an inbox before sending: the
     /// inbox id as username, one of its API keys as password. When clear,
     /// mail sent without authenticating goes to the default inbox.
@@ -50,8 +68,12 @@ impl Default for SmtpConfig {
             max_message_size: 25 * 1024 * 1024,
             max_recipients: 100,
             max_connections: 100,
+            max_connections_per_ip: 10,
             idle_timeout: Duration::from_secs(120),
+            data_timeout: Duration::from_secs(600),
             auth_failure_delay: Duration::from_secs(1),
+            max_auth_failures_per_ip: 10,
+            auth_lockout: Duration::from_secs(15 * 60),
             require_auth: false,
             tls: None,
         }
@@ -61,13 +83,154 @@ impl Default for SmtpConfig {
 struct Context {
     store: Arc<Store>,
     config: SmtpConfig,
+    peers: Arc<Peers>,
+}
+
+/// What is known about the addresses talking to this server: how many
+/// connections each holds and how many logins each has failed.
+///
+/// Every address is counted except the operator's own networks (see
+/// `own_network`), where a Docker bridge or a parallel test suite can rightly
+/// open many connections at once. An IPv6 client is counted by its /64, since
+/// one host can have that many.
+#[derive(Default)]
+struct Peers {
+    connections: Mutex<HashMap<IpAddr, usize>>,
+    failures: Mutex<HashMap<IpAddr, Failures>>,
+}
+
+struct Failures {
+    count: usize,
+    since: Instant,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whether an address is on a network the operator runs: this machine, a
+/// private or link-local network, or shared address space (100.64.0.0/10, as
+/// Tailscale uses). Only these are exempt, so an unusual but routable range,
+/// such as Teredo's, is limited like any other.
+fn own_network(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || (a == 100 && (64..128).contains(&b))
+        }
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
+    }
+}
+
+/// The key an address is counted under, or `None` for one not counted.
+fn peer_key(ip: IpAddr) -> Option<IpAddr> {
+    let ip = ip.to_canonical();
+    if own_network(ip) {
+        return None;
+    }
+    Some(match ip {
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+        v4 => v4,
+    })
+}
+
+/// One connection's place in its address's count, given back on drop.
+struct PeerSlot {
+    peers: Arc<Peers>,
+    key: Option<IpAddr>,
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let Some(key) = self.key else { return };
+        let mut connections = lock(&self.peers.connections);
+        if let Some(count) = connections.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                connections.remove(&key);
+            }
+        }
+    }
+}
+
+impl Peers {
+    /// A place for one more connection from `ip`, or `None` at its limit.
+    fn admit(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<PeerSlot> {
+        let key = peer_key(ip);
+        if let Some(key) = key {
+            let mut connections = lock(&self.connections);
+            let count = connections.entry(key).or_insert(0);
+            if *count >= max.max(1) {
+                return None;
+            }
+            *count += 1;
+        }
+        Some(PeerSlot {
+            peers: self.clone(),
+            key,
+        })
+    }
+
+    fn locked_out(&self, ip: IpAddr, config: &SmtpConfig) -> bool {
+        let Some(key) = peer_key(ip) else {
+            return false;
+        };
+        lock(&self.failures).get(&key).is_some_and(|f| {
+            f.count >= config.max_auth_failures_per_ip && f.since.elapsed() < config.auth_lockout
+        })
+    }
+
+    /// Count a failed login from `ip`; `true` once that locks the address out.
+    fn record_failure(&self, ip: IpAddr, config: &SmtpConfig) -> bool {
+        let Some(key) = peer_key(ip) else {
+            return false;
+        };
+        let now = Instant::now();
+        let mut failures = lock(&self.failures);
+        if !failures.contains_key(&key) && failures.len() >= MAX_TRACKED_PEERS {
+            failures.retain(|_, f| now.duration_since(f.since) < config.auth_lockout);
+            if failures.len() >= MAX_TRACKED_PEERS {
+                return false;
+            }
+        }
+        let entry = failures.entry(key).or_insert(Failures {
+            count: 0,
+            since: now,
+        });
+        if now.duration_since(entry.since) >= config.auth_lockout {
+            *entry = Failures {
+                count: 0,
+                since: now,
+            };
+        }
+        entry.count += 1;
+        entry.count >= config.max_auth_failures_per_ip
+    }
+}
+
+/// Turn a connection away with one reply line, without holding up accepting.
+fn refuse(mut stream: TcpStream, reply: &'static str) {
+    tokio::spawn(async move {
+        let _ = stream.write_all(reply.as_bytes()).await;
+        let _ = stream.write_all(b"\r\n").await;
+    });
 }
 
 pub async fn serve(listener: TcpListener, store: Arc<Store>, config: SmtpConfig) -> Result<()> {
     let slots = Arc::new(Semaphore::new(config.max_connections.max(1)));
-    let context = Arc::new(Context { store, config });
+    let context = Arc::new(Context {
+        store,
+        config,
+        peers: Arc::default(),
+    });
     loop {
-        let (mut stream, peer) = match listener.accept().await {
+        let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(error) => {
                 // Usually file-descriptor exhaustion; back off instead of spinning.
@@ -76,12 +239,22 @@ pub async fn serve(listener: TcpListener, store: Arc<Store>, config: SmtpConfig)
                 continue;
             }
         };
+        if context.peers.locked_out(peer.ip(), &context.config) {
+            refuse(stream, LOCKED_OUT);
+            continue;
+        }
+        let Some(peer_slot) = context
+            .peers
+            .admit(peer.ip(), context.config.max_connections_per_ip)
+        else {
+            refuse(
+                stream,
+                "421 4.7.0 Too many connections from your address, try again later",
+            );
+            continue;
+        };
         let Ok(slot) = slots.clone().try_acquire_owned() else {
-            tokio::spawn(async move {
-                let _ = stream
-                    .write_all(b"421 4.7.0 Too many connections, try again later\r\n")
-                    .await;
-            });
+            refuse(stream, "421 4.7.0 Too many connections, try again later");
             continue;
         };
         let context = context.clone();
@@ -90,6 +263,7 @@ pub async fn serve(listener: TcpListener, store: Arc<Store>, config: SmtpConfig)
                 tracing::debug!(%peer, %error, "SMTP connection ended with an error");
             }
             drop(slot);
+            drop(peer_slot);
         });
     }
 }
@@ -181,7 +355,8 @@ struct Session<'a, S> {
     /// The inbox this client authenticated as, and so delivers into.
     inbox: Option<String>,
     auth_failures: usize,
-    bad_commands: usize,
+    /// Commands refused with a permanent error.
+    errors: usize,
     mail_from: Option<String>,
     recipients: Vec<String>,
     line: Vec<u8>,
@@ -204,6 +379,9 @@ fn path_and_params(rest: &str) -> Option<(String, &str)> {
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Session<'_, S> {
     async fn reply(&mut self, text: &str) -> std::io::Result<()> {
+        if text.starts_with('5') {
+            self.errors += 1;
+        }
         let stream = self.reader.get_mut();
         stream.write_all(text.as_bytes()).await?;
         stream.write_all(b"\r\n").await?;
@@ -279,6 +457,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<'_, S> {
             self.reply("538 5.7.11 Encryption required: issue STARTTLS first")
                 .await?;
             return Ok(true);
+        }
+        // Checked here as well as on connecting, so connections opened before
+        // the lockout cannot keep guessing.
+        if self
+            .context
+            .peers
+            .locked_out(self.peer.ip(), &self.context.config)
+        {
+            self.reply(LOCKED_OUT).await?;
+            return Ok(false);
         }
         let (mechanism, initial) = args.split_once(' ').unwrap_or((args, ""));
         let decode = |value: &str| BASE64.decode(value.trim()).ok();
@@ -368,11 +556,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<'_, S> {
             return Ok(true);
         }
         self.auth_failures += 1;
-        tracing::warn!(peer = %self.peer, "SMTP authentication failed");
+        // One stable line per failure, naming the address and nothing the
+        // client typed, so a log watcher such as fail2ban can match it.
+        let ip = self.peer.ip().to_canonical();
+        tracing::warn!(%ip, "SMTP authentication failed");
+        let locked_out = self.context.peers.record_failure(ip, &self.context.config);
+        if locked_out {
+            tracing::warn!(%ip, "SMTP address locked out after repeated authentication failures");
+        }
         tokio::time::sleep(self.context.config.auth_failure_delay).await;
-        if self.auth_failures >= MAX_AUTH_FAILURES {
-            self.reply("421 4.7.0 Too many failed authentication attempts")
-                .await?;
+        if locked_out || self.auth_failures >= MAX_AUTH_FAILURES {
+            self.reply(LOCKED_OUT).await?;
             return Ok(false);
         }
         self.reply("535 5.7.8 Authentication credentials invalid")
@@ -436,12 +630,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<'_, S> {
 
         let max = self.context.config.max_message_size;
         let idle = self.context.config.idle_timeout;
+        let deadline = Instant::now() + self.context.config.data_timeout;
         let mut message: Vec<u8> = Vec::new();
         let mut too_large = false;
         loop {
             // An oversized message is read to its end rather than cut off, so
             // the client gets a clean rejection and the stream stays in sync.
-            match tokio::time::timeout(idle, read_line(self.reader, &mut self.line, max)).await {
+            // The deadline bounds how long that, or a trickle, can go on.
+            let wait = deadline.min(Instant::now() + idle);
+            let read = read_line(self.reader, &mut self.line, max);
+            match tokio::time::timeout_at(wait, read).await {
+                Err(_) if wait == deadline => {
+                    self.reply("421 4.4.2 Message took too long to arrive, closing")
+                        .await?;
+                    return Ok(false);
+                }
                 Err(_) => {
                     self.reply("421 4.4.2 Idle too long, closing").await?;
                     return Ok(false);
@@ -578,14 +781,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<'_, S> {
                 "GET" | "POST" | "PUT" | "HEAD" | "OPTIONS" | "DELETE" | "PATCH" | "CONNECT" => {
                     return Ok(Outcome::Closed);
                 }
-                _ => {
-                    self.bad_commands += 1;
-                    if self.bad_commands >= MAX_BAD_COMMANDS {
-                        self.reply("421 4.7.0 Too many errors, closing").await?;
-                        return Ok(Outcome::Closed);
-                    }
-                    self.reply("500 5.5.2 Command not recognized").await?;
-                }
+                _ => self.reply("500 5.5.2 Command not recognized").await?,
+            }
+            if self.errors >= MAX_ERRORS {
+                self.reply("421 4.7.0 Too many errors, closing").await?;
+                return Ok(Outcome::Closed);
             }
         }
     }
@@ -605,7 +805,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         authenticated: false,
         inbox: None,
         auth_failures: 0,
-        bad_commands: 0,
+        errors: 0,
         mail_from: None,
         recipients: Vec::new(),
         line: Vec::new(),
@@ -829,5 +1029,248 @@ mod tests {
             reply.starts_with("421 4.7.0 Too many connections"),
             "{reply}"
         );
+    }
+
+    /// A context as `serve` builds it, for driving sessions directly.
+    fn context(config: SmtpConfig) -> (Arc<Context>, Arc<Store>) {
+        let store = Arc::new(Store::in_memory().unwrap());
+        let context = Arc::new(Context {
+            store: store.clone(),
+            config,
+            peers: Arc::default(),
+        });
+        (context, store)
+    }
+
+    /// Run `script` through a session as if it came from `peer`, which a test
+    /// cannot otherwise do from anywhere but loopback.
+    async fn converse_as(context: &Arc<Context>, peer: &str, script: &str) -> String {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let peer: SocketAddr = peer.parse().unwrap();
+        let context = context.clone();
+        let server = tokio::spawn(async move {
+            let mut reader = BufReader::new(server);
+            let _ = session(&mut reader, peer, &context, false).await;
+        });
+        let (mut read, mut write) = tokio::io::split(client);
+        write.write_all(script.as_bytes()).await.unwrap();
+        write.shutdown().await.unwrap();
+        let mut reply = String::new();
+        read.read_to_string(&mut reply).await.unwrap();
+        server.await.unwrap();
+        reply
+    }
+
+    /// A TLS acceptor with no certificate. Enough to make STARTTLS a
+    /// configured option; no handshake is ever completed with it.
+    fn tls_without_a_certificate() -> TlsAcceptor {
+        use tokio_rustls::rustls::ServerConfig;
+        use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert};
+        use tokio_rustls::rustls::sign::CertifiedKey;
+
+        #[derive(Debug)]
+        struct NoCertificate;
+        impl ResolvesServerCert for NoCertificate {
+            fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+                None
+            }
+        }
+        let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(NoCertificate));
+        TlsAcceptor::from(Arc::new(config))
+    }
+
+    #[tokio::test]
+    async fn refuses_auth_in_the_clear_once_tls_is_configured() {
+        let (context, store) = context(SmtpConfig {
+            require_auth: true,
+            auth_failure_delay: Duration::ZERO,
+            tls: Some(tls_without_a_certificate()),
+            ..SmtpConfig::default()
+        });
+        store.create_inbox("billing").unwrap();
+        let (_, key) = store.create_key("billing", "app").unwrap();
+
+        // Even a client that ignores EHLO and sends a valid pair in the clear
+        // is refused before the credentials are looked at.
+        let script = format!("EHLO t\r\nAUTH PLAIN {}\r\n{BODY}", plain("billing", &key));
+        let reply = converse_as(&context, "203.0.113.5:40000", &script).await;
+        assert!(reply.contains("STARTTLS"), "offered: {reply}");
+        assert!(!reply.contains("AUTH PLAIN"), "not advertised: {reply}");
+        assert!(reply.contains("538 5.7.11"), "{reply}");
+        assert!(!reply.contains("235"), "{reply}");
+        assert!(reply.contains("530 5.7.0"), "{reply}");
+        let script = format!(
+            "AUTH LOGIN\r\n{}\r\n{}\r\nQUIT\r\n",
+            BASE64.encode("billing"),
+            BASE64.encode(&key)
+        );
+        let reply = converse_as(&context, "203.0.113.5:40001", &script).await;
+        assert!(reply.starts_with("538 5.7.11"), "{reply}");
+        assert_eq!(store.stats(None).unwrap().total, 0);
+    }
+
+    #[tokio::test]
+    async fn locks_out_an_address_that_keeps_failing_across_connections() {
+        let (context, store) = context(SmtpConfig {
+            require_auth: true,
+            auth_failure_delay: Duration::ZERO,
+            max_auth_failures_per_ip: 4,
+            ..SmtpConfig::default()
+        });
+        store.create_inbox("billing").unwrap();
+        let (_, key) = store.create_key("billing", "app").unwrap();
+        let wrong = format!("AUTH PLAIN {}\r\n", plain("billing", "wrong"));
+        let right = format!("AUTH PLAIN {}\r\n{BODY}", plain("billing", &key));
+
+        let reply = converse_as(&context, "1.1.1.1:40000", &wrong.repeat(3)).await;
+        assert_eq!(reply.matches("535 5.7.8").count(), 2, "{reply}");
+        // The fourth failure, on a fresh connection, locks the address.
+        let reply = converse_as(&context, "1.1.1.1:40001", &wrong).await;
+        assert!(reply.starts_with(LOCKED_OUT), "{reply}");
+        // Now even the right key is turned away from that address,
+        let reply = converse_as(&context, "1.1.1.1:40002", &right).await;
+        assert!(reply.starts_with(LOCKED_OUT), "{reply}");
+        assert!(
+            context
+                .peers
+                .locked_out("1.1.1.1".parse().unwrap(), &context.config)
+        );
+        // but not from another,
+        let reply = converse_as(&context, "9.9.9.9:40000", &right).await;
+        assert!(reply.contains("235 2.7.0"), "{reply}");
+        // nor from a private network, which is the operator's own.
+        converse_as(&context, "10.0.0.5:40000", &wrong.repeat(3)).await;
+        converse_as(&context, "10.0.0.5:40001", &wrong.repeat(3)).await;
+        let reply = converse_as(&context, "10.0.0.5:40002", &right).await;
+        assert!(reply.contains("235 2.7.0"), "{reply}");
+        assert_eq!(store.stats(Some("billing")).unwrap().total, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lockout_ends_after_its_window() {
+        let config = SmtpConfig {
+            max_auth_failures_per_ip: 2,
+            ..SmtpConfig::default()
+        };
+        let peers = Peers::default();
+        let ip: IpAddr = "1.1.1.1".parse().unwrap();
+        assert!(!peers.record_failure(ip, &config));
+        assert!(peers.record_failure(ip, &config));
+        assert!(peers.locked_out(ip, &config));
+        tokio::time::advance(config.auth_lockout).await;
+        assert!(!peers.locked_out(ip, &config));
+        assert!(!peers.record_failure(ip, &config), "a fresh window");
+    }
+
+    #[test]
+    fn counts_connections_per_public_address() {
+        let peers = Arc::new(Peers::default());
+        let ip: IpAddr = "1.1.1.1".parse().unwrap();
+        let first = peers.admit(ip, 2).unwrap();
+        let _second = peers.admit(ip, 2).unwrap();
+        assert!(peers.admit(ip, 2).is_none(), "at the limit");
+        assert!(peers.admit("9.9.9.9".parse().unwrap(), 2).is_some());
+        drop(first);
+        assert!(peers.admit(ip, 2).is_some(), "a place is given back");
+
+        // One IPv6 host holds a whole /64, so that is what is counted.
+        let _a = peers.admit("2606:4700::1".parse().unwrap(), 1).unwrap();
+        assert!(
+            peers
+                .admit("2606:4700::ffff:2".parse().unwrap(), 1)
+                .is_none()
+        );
+        assert!(
+            peers
+                .admit("2606:4700:0:1::1".parse().unwrap(), 1)
+                .is_some()
+        );
+        // A mapped IPv4 address is that address.
+        let _b = peers.admit("8.8.4.4".parse().unwrap(), 1).unwrap();
+        assert!(peers.admit("::ffff:8.8.4.4".parse().unwrap(), 1).is_none());
+
+        // Routable special-purpose ranges, such as Teredo's, are limited too.
+        let _t = peers
+            .admit("2001:0:4136:e378::1".parse().unwrap(), 1)
+            .unwrap();
+        assert!(
+            peers
+                .admit("2001:0:4136:e378::2".parse().unwrap(), 1)
+                .is_none()
+        );
+
+        // The operator's own networks are not limited.
+        let own = [
+            "127.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "10.0.0.5",
+            "172.17.0.1",
+            "192.168.1.2",
+            "169.254.1.1",
+            "100.100.1.1",
+            "fd00::1",
+            "fe80::1",
+        ];
+        for ip in own {
+            let ip: IpAddr = ip.parse().unwrap();
+            let held: Vec<_> = (0..20).map(|_| peers.admit(ip, 1).unwrap()).collect();
+            assert_eq!(held.len(), 20);
+        }
+    }
+
+    #[tokio::test]
+    async fn drops_clients_that_keep_making_errors() {
+        let config = SmtpConfig {
+            require_auth: true,
+            ..SmtpConfig::default()
+        };
+        let (addr, _store) = start(config).await;
+        // Recognised commands count too, not only unknown ones.
+        let reply = converse(addr, &"MAIL FROM:<a@x.test>\r\n".repeat(20)).await;
+        assert_eq!(reply.matches("530 5.7.0").count(), MAX_ERRORS, "{reply}");
+        assert!(
+            reply.ends_with("421 4.7.0 Too many errors, closing\r\n"),
+            "{reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_body_has_a_deadline_however_steadily_it_trickles() {
+        let config = SmtpConfig {
+            data_timeout: Duration::from_millis(300),
+            ..SmtpConfig::default()
+        };
+        let (addr, store) = start(config).await;
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (mut read, mut write) = stream.into_split();
+        // A line every 50ms never trips the idle timeout, only the deadline.
+        let writer = tokio::spawn(async move {
+            write
+                .write_all(b"EHLO t\r\nMAIL FROM:<a@x.test>\r\nRCPT TO:<b@x.test>\r\nDATA\r\n")
+                .await?;
+            for _ in 0..40 {
+                write.write_all(b"still sending\r\n").await?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            std::io::Result::Ok(())
+        });
+        let mut reply = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while let Ok(n @ 1..) = read.read(&mut chunk).await {
+            reply.extend_from_slice(&chunk[..n]);
+        }
+        writer.abort();
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(
+            reply.contains("421 4.4.2 Message took too long to arrive"),
+            "{reply}"
+        );
+        assert_eq!(store.stats(None).unwrap().total, 0);
     }
 }

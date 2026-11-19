@@ -383,8 +383,12 @@ whoever sends it. The design assumes both.
   `Secure` over HTTPS; the credential never reaches the browser. They end on
   sign-out, after seven days, or on restart.
 - **Guessing is slowed.** The admin token is compared in constant time, failed
-  sign-ins are delayed, and three bad SMTP logins close the connection. With
-  TLS, SMTP accepts `AUTH` only after `STARTTLS`.
+  sign-ins are delayed, and three bad SMTP logins close the connection. A
+  public address that fails ten SMTP logins, over any number of connections, is
+  refused for 15 minutes. Each failure is logged as one line,
+  `WARN SMTP authentication failed ip=<address>`, for fail2ban or similar. With
+  TLS, SMTP accepts `AUTH` only after `STARTTLS`, even from a client that sends
+  it unprompted.
 - **Browsers are kept out.** Without a token, only `localhost` names are served,
   which stops DNS rebinding; state-changing requests from other origins are
   refused.
@@ -393,7 +397,11 @@ whoever sends it. The design assumes both.
   strict CSP. Remote images do load when you open a message, as in a mail
   client.
 - **It never relays**, and size, recipients, connections, message count and
-  storage are all capped.
+  storage are all capped. SMTP holds 100 connections, ten from any one public
+  address (an IPv6 /64 counts as one). A client is dropped after ten refused
+  commands, two minutes of silence, or ten minutes spent sending one message.
+  Loopback, private and link-local networks, and 100.64.0.0/10 (as Tailscale
+  uses), are exempt from the per-address limits.
 - **Webhooks stay off the local network** unless the server is yours alone:
   with an admin token or an exposed HTTP listener, only public addresses are
   posted to. This machine, private, link-local and other special-purpose

@@ -4,7 +4,7 @@ emailulator is MIT licensed (see LICENSE). The binary also contains the
 following open-source crates, under the licenses below, and the client-support
 data from caniemail.com, at the end.
 
-- Apache License 2.0 (170)
+- Apache License 2.0 (173)
 - MIT License (84)
 - Unicode License v3 (19)
 - ISC License (18)
@@ -677,7 +677,7 @@ Used by:
 Used by:
 
 - linux-raw-sys 0.12.1
-- rustix 1.1.5
+- rustix 1.1.6
 
 ```
 
@@ -1198,10 +1198,13 @@ Used by:
 - windows-numerics 0.3.1
 - windows-result 0.4.1
 - windows-strings 0.5.1
+- windows-sys 0.52.0
 - windows-sys 0.61.2
+- windows-targets 0.52.6
 - windows-threading 0.2.1
 - windows-version 0.1.7
 - windows 0.62.2
+- windows_x86_64_msvc 0.52.6
 
 ```
                                  Apache License
@@ -4012,7 +4015,7 @@ Used by:
 - percent-encoding 2.3.2
 - png 0.18.1
 - ring 0.17.14
-- rustix 1.1.5
+- rustix 1.1.6
 - rustls-native-certs 0.8.5
 - rustls 0.23.46
 - scopeguard 1.2.0
@@ -6766,8 +6769,8 @@ THE SOFTWARE.
 
 Used by:
 
-- libsqlite3-sys 0.38.2
-- rusqlite 0.40.2
+- libsqlite3-sys 0.39.1
+- rusqlite 0.41.1
 
 ```
 Copyright (c) 2014 The rusqlite developers

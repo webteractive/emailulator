@@ -144,7 +144,8 @@ admin token, or anyone on a local server without one).
 | `GET /api/v1/deliveries` | The webhook delivery log, newest first; filters `inbox`, `webhook`, `message`, `limit` |
 | `POST /api/v1/deliveries/{id}/replay` | Send a delivery again |
 | `GET /api/v1/events` | Server-sent events as mail arrives and changes |
-| `GET /api/v1/info` · `GET /healthz` | Server details · `ok` |
+| `GET /api/v1/info` | Server details |
+| `GET /healthz` · `GET /up` | Health check: `ok`, with no sign-in |
 
 `{id}` is a message's number or its `em_…` email ID.
 

@@ -175,6 +175,10 @@ where
         .map_err(ApiError::from)
 }
 
+async fn health() -> &'static str {
+    "ok"
+}
+
 pub fn router(store: Arc<Store>, config: HttpConfig) -> Router {
     let max_message_size = config.info.max_message_size;
     let state: Shared = Arc::new(AppState {
@@ -184,7 +188,9 @@ pub fn router(store: Arc<Store>, config: HttpConfig) -> Router {
     });
 
     let mut router = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(health))
+        // The path our other sites answer health checks on.
+        .route("/up", get(health))
         .route(
             "/api/v1/session",
             get(session_status).post(session_open).delete(session_close),
@@ -2156,10 +2162,12 @@ mod tests {
             send(&app, empty(request("GET", "/"))).await.0,
             StatusCode::OK
         );
-        assert_eq!(
-            send(&app, empty(request("GET", "/healthz"))).await.0,
-            StatusCode::OK
-        );
+        for probe in ["/healthz", "/up"] {
+            assert_eq!(
+                send(&app, empty(request("GET", probe))).await.0,
+                StatusCode::OK
+            );
+        }
     }
 
     #[tokio::test]
